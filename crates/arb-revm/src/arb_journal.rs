@@ -22,6 +22,7 @@
 //! existing in-EVM dispatcher, the crate compiles and every existing test passes after each
 //! individual conversion.
 
+use crate::ArbChainContext;
 use alloy_evm::{EvmInternals, EvmInternalsError};
 use revm::{
     context_interface::{
@@ -499,6 +500,12 @@ pub trait ArbPrecompileCtx {
     /// `block.basefee`, the current L2 base fee (wei).
     fn block_basefee(&self) -> u64;
 
+    /// Nitro's `BlockContext.BaseFeeInBlock`: the block's real base fee retained when an RPC
+    /// simulation lowers `block.basefee` to zero.
+    fn base_fee_in_block(&self) -> Option<u64> {
+        None
+    }
+
     /// `block.number`.
     fn block_number(&self) -> u64;
 
@@ -534,7 +541,7 @@ pub trait ArbPrecompileCtx {
 /// every `<CTX: ContextTr>`-bounded precompile working after migration to the `Arb*` bound.
 impl<CTX> ArbPrecompileCtx for CTX
 where
-    CTX: ContextTr<Journal: JournalTr> + Host,
+    CTX: ContextTr<Chain = ArbChainContext, Journal: JournalTr> + Host,
 {
     type Journal = CTX::Journal;
 
@@ -544,6 +551,10 @@ where
 
     fn block_basefee(&self) -> u64 {
         self.block().basefee()
+    }
+
+    fn base_fee_in_block(&self) -> Option<u64> {
+        self.chain().base_fee_in_block
     }
 
     fn block_number(&self) -> u64 {

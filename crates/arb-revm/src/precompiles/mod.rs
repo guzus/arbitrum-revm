@@ -823,7 +823,11 @@ impl Default for ArbPrecompiles {
 
 impl<CTX> PrecompileProvider<CTX> for ArbPrecompiles
 where
-    CTX: ContextTr<Journal: JournalTr, Cfg: revm::context::Cfg<Spec = ArbSpecId>>,
+    CTX: ContextTr<
+            Chain = crate::ArbChainContext,
+            Journal: JournalTr,
+            Cfg: revm::context::Cfg<Spec = ArbSpecId>,
+        >,
 {
     type Output = InterpreterResult;
 

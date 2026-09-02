@@ -19,7 +19,12 @@ where
     };
 
     let state = ArbosState::open();
-    let l2_gas_price = U256::from(ctx.block_basefee());
+    // Nitro's ArbGasInfo prefers BaseFeeInBlock when present. RPC simulations keep the real
+    // block fee there while lowering block.basefee to zero so the caller itself is not charged.
+    let l2_gas_price = U256::from(
+        ctx.base_fee_in_block()
+            .unwrap_or_else(|| ctx.block_basefee()),
+    );
 
     // ArbOS version is a cached field on Nitro's opened `ArbosState` (no per-read storage charge),
     // so read it through the raw journal to keep it unmetered. Every other ArbOS-storage read below
@@ -410,4 +415,85 @@ where
         result.output = revm::primitives::Bytes::new();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        api::default_ctx::{ArbContext, DefaultArb},
+        storage::ArbosState,
+    };
+    use alloy_core::sol_types::SolCall;
+    use revm::{
+        context_interface::ContextTr, database_interface::EmptyDB, interpreter::InstructionResult,
+    };
+
+    fn prices_in_wei(
+        arbos_version: u64,
+        block_basefee: u64,
+        base_fee_in_block: Option<u64>,
+    ) -> Vec<U256> {
+        let mut ctx = <ArbContext<EmptyDB> as DefaultArb>::arb();
+        ctx.block.basefee = block_basefee;
+        ctx.chain.base_fee_in_block = base_fee_in_block;
+
+        let state = ArbosState::open();
+        state
+            .arbos_version
+            .set(arbos_version, ContextTr::journal_mut(&mut ctx))
+            .unwrap();
+        state
+            .l2_pricing
+            .min_base_fee_wei
+            .set(U256::from(10), ContextTr::journal_mut(&mut ctx))
+            .unwrap();
+        state
+            .l1_pricing
+            .price_per_unit
+            .set(U256::from(20), ContextTr::journal_mut(&mut ctx))
+            .unwrap();
+
+        let input = ArbGasInfo::getPricesInWeiCall {}.abi_encode();
+        let result = run_arb_gas_info(&mut ctx, &input, 100_000);
+        assert_eq!(result.result, InstructionResult::Return);
+        result
+            .output
+            .as_ref()
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|word| U256::from_be_slice(word))
+            .collect()
+    }
+
+    #[test]
+    fn prices_use_real_block_fee_during_zero_fee_simulation() {
+        let prices = prices_in_wei(4, 0, Some(57));
+
+        assert_eq!(prices[2], U256::from(57 * STORAGE_WRITE_COST));
+        assert_eq!(prices[3], U256::from(10));
+        assert_eq!(prices[4], U256::from(47));
+        assert_eq!(prices[5], U256::from(57));
+    }
+
+    #[test]
+    fn pre_arbos_4_prices_use_real_block_fee_during_zero_fee_simulation() {
+        let prices = prices_in_wei(3, 0, Some(57));
+
+        assert_eq!(prices[2], U256::from(57 * STORAGE_WRITE_COST));
+        assert_eq!(prices[3], U256::from(57));
+        assert_eq!(prices[4], U256::ZERO);
+        assert_eq!(prices[5], U256::from(57));
+    }
+
+    #[test]
+    fn prices_fall_back_to_evm_block_fee() {
+        let prices = prices_in_wei(4, 23, None);
+
+        assert_eq!(prices[2], U256::from(23 * STORAGE_WRITE_COST));
+        assert_eq!(prices[3], U256::from(10));
+        assert_eq!(prices[4], U256::from(13));
+        assert_eq!(prices[5], U256::from(23));
+    }
 }
