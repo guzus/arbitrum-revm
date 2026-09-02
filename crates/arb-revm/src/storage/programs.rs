@@ -161,6 +161,11 @@ impl ProgramInfo {
         }
         Ok(())
     }
+
+    pub(crate) fn is_expired(self, timestamp: u64, expiry_days: u16) -> bool {
+        self.activated_at == 0
+            || self.age_seconds(timestamp) > u64::from(expiry_days).saturating_mul(24 * 60 * 60)
+    }
 }
 
 /// Typed view over ArbOS Programs substorage roots.
@@ -615,6 +620,9 @@ mod tests {
                 age: 24 * 60 * 60 + 1,
             })
         );
+        assert!(!program.is_expired(activation_time + 24 * 60 * 60, 1));
+        assert!(program.is_expired(activation_time + 24 * 60 * 60 + 1, 1));
+        assert!(ProgramInfo::default().is_expired(activation_time, 1));
     }
 
     /// After `programs.initialize(30, ..)` the packed params word must have

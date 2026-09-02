@@ -8,7 +8,7 @@ use crate::storage::{
 use crate::{
     arb_journal::ArbJournal,
     stylus::params::StylusParams,
-    stylus::program::{stylus_activate, stylus_code},
+    stylus::program::{evict_program, stylus_activate, stylus_code},
 };
 use revm::interpreter::InterpreterResult;
 use revm::primitives::{B256, Bytes, keccak256};
@@ -404,12 +404,14 @@ where
     };
     let code_hash = keccak256(&code);
 
-    // Reject re-activation of an already up-to-date program (Nitro ProgramUpToDateError).
+    // Reject re-activation of an already up-to-date, non-expired program (Nitro
+    // ProgramUpToDateError). Expired programs may be activated again at the same version.
     let existing = match state.programs.read_program(code_hash, ctx.journal_mut()) {
         Ok(p) => p,
         Err(e) => return revert_result(gas_limit, &format!("ArbWasm: program read error: {e}")),
     };
-    if existing.version == params.version && existing.activated_at != 0 {
+    let time = ctx.block_timestamp();
+    if existing.version == params.version && !existing.is_expired(time, params.expiry_days) {
         return revert_result(gas_limit, "ArbWasm: program already activated");
     }
 
@@ -421,7 +423,7 @@ where
         activation_gas_read
             .saturating_add(configured_activation_gas)
             .saturating_add(ACTIVATION_FIXED_GAS)
-            .saturating_add(ACTIVATION_STORAGE_GAS),
+            .saturating_add(activation_storage_gas(existing.cached)),
     ) {
         return InterpreterResult {
             result: InstructionResult::OutOfGas,
@@ -512,8 +514,6 @@ where
         }
     };
     let module_hash = B256::from(module.hash().0);
-    let time = ctx.block_timestamp();
-
     // Data fee for the estimated asm size (advances + persists the demand model).
     let data_fee =
         match state
@@ -540,7 +540,7 @@ where
         footprint: stylus_data.footprint,
         activated_at,
         asm_estimate_kb,
-        cached: false,
+        cached: existing.cached,
     };
     if let Err(e) = state
         .programs
@@ -595,6 +595,10 @@ where
     // Charge the event's LOG gas (Nitro burns it through the precompile burner on emit).
     let _ = gas.record_regular_cost(ACTIVATION_EVENT_GAS);
 
+    // The executable caches are keyed by code hash, not by the activated module hash. Remove any
+    // prior-version entry now that the new activation record is visible.
+    evict_program(code_hash);
+
     InterpreterResult {
         result: InstructionResult::Return,
         output: Bytes::from(alloy_core::sol_types::SolValue::abi_encode(&(
@@ -624,6 +628,11 @@ const fn activation_gas_read_cost(arbos_version: u64) -> u64 {
     }
 }
 
+#[cfg(feature = "stylus")]
+const fn activation_storage_gas(existing_cached: bool) -> u64 {
+    ACTIVATION_STORAGE_GAS + if existing_cached { PROGRAM_READ_GAS } else { 0 }
+}
+
 #[cfg(all(test, feature = "stylus"))]
 mod tests {
     use alloy_core::sol_types::SolCall;
@@ -637,7 +646,7 @@ mod tests {
 
     use super::{
         ACTIVATION_FIXED_GAS, ACTIVATION_STORAGE_GAS, ArbWasm, activation_gas_read_cost,
-        fragment_read_gas_cost, run_arb_wasm,
+        activation_storage_gas, fragment_read_gas_cost, run_arb_wasm,
     };
     use crate::{
         api::default_ctx::{ArbContext, DefaultArb},
@@ -751,5 +760,11 @@ mod tests {
         assert_eq!(activation_gas_read_cost(58), 0);
         assert_eq!(activation_gas_read_cost(59), 800);
         assert_eq!(activation_gas_read_cost(61), 800);
+    }
+
+    #[test]
+    fn cached_reactivation_charges_the_prior_module_hash_read() {
+        assert_eq!(activation_storage_gas(false), ACTIVATION_STORAGE_GAS);
+        assert_eq!(activation_storage_gas(true), ACTIVATION_STORAGE_GAS + 800);
     }
 }
