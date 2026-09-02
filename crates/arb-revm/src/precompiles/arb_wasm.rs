@@ -1,7 +1,7 @@
 use super::*;
 use crate::arb_journal::{ArbCall, ArbPrecompileCtx};
 use crate::storage::{
-    programs::{ARBITRUM_START_TIME, ProgramInfo},
+    programs::{ARBITRUM_START_TIME, ProgramActivationError, ProgramInfo},
     stylus_param_layout as layout, unpack_uint,
 };
 #[cfg(feature = "stylus")]
@@ -335,34 +335,26 @@ where
         }
     };
     let params_version = unpack_uint(params_word, layout::VERSION.0, layout::VERSION.1) as u16;
-    let error = if program.version == 0 {
-        Some(custom_error_result(
-            gas_limit,
-            b"ProgramNotActivated()",
-            &[],
-        ))
-    } else if program.version != params_version {
-        let args = alloy_core::sol_types::SolValue::abi_encode(&(program.version, params_version));
-        Some(custom_error_result(
-            gas_limit,
-            b"ProgramNeedsUpgrade(uint16,uint16)",
-            &args,
-        ))
-    } else {
-        let activated_at = ARBITRUM_START_TIME
-            .saturating_add(u64::from(program.activated_at).saturating_mul(3600));
-        let age = ctx.block_timestamp().saturating_sub(activated_at);
-        let expiry_days = u64::from(unpack_uint(
-            params_word,
-            layout::EXPIRY_DAYS.0,
-            layout::EXPIRY_DAYS.1,
-        ));
-        let expiry = expiry_days.saturating_mul(24 * 60 * 60);
-        (age > expiry).then(|| {
-            let args = alloy_core::sol_types::SolValue::abi_encode(&(age,));
-            custom_error_result(gas_limit, b"ProgramExpired(uint64)", &args)
-        })
-    };
+    let expiry_days = unpack_uint(params_word, layout::EXPIRY_DAYS.0, layout::EXPIRY_DAYS.1) as u16;
+    let error = program
+        .validate_active(ctx.block_timestamp(), params_version, expiry_days)
+        .err()
+        .map(|error| match error {
+            ProgramActivationError::NotActivated => {
+                custom_error_result(gas_limit, b"ProgramNotActivated()", &[])
+            }
+            ProgramActivationError::NeedsUpgrade {
+                version,
+                stylus_version,
+            } => {
+                let args = alloy_core::sol_types::SolValue::abi_encode(&(version, stylus_version));
+                custom_error_result(gas_limit, b"ProgramNeedsUpgrade(uint16,uint16)", &args)
+            }
+            ProgramActivationError::Expired { age } => {
+                let args = alloy_core::sol_types::SolValue::abi_encode(&(age,));
+                custom_error_result(gas_limit, b"ProgramExpired(uint64)", &args)
+            }
+        });
 
     match error {
         Some(result) => Err(charge_result(result, PROGRAM_READ_GAS)),

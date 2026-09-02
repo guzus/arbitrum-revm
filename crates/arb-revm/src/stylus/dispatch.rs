@@ -16,7 +16,7 @@ use revm::{
     Database,
     context::{ContextError, FrameStack},
     context_interface::{
-        Cfg, ContextTr, JournalTr,
+        Block, Cfg, ContextTr, JournalTr,
         journaled_state::{JournalCheckpoint, account::JournaledAccountTr},
     },
     handler::{
@@ -36,7 +36,7 @@ use stylus::prover::programs::config::{CompileConfig, StylusConfig};
 use crate::{
     api::exec::ArbContextTr,
     evm::ArbEvm,
-    storage::ArbosState,
+    storage::{ArbosState, programs::ProgramActivationError},
     stylus::{
         api::{HostCallFunc, StylusHandler, handle_request},
         executor::{ProgramRun, build_evm_data, run_program},
@@ -106,6 +106,28 @@ where
             let params = StylusParams::from_word(&params_word);
             let arbos_version = ctx.cfg().spec().arbos_version();
             let debug = ArbosState::open().debug_mode(ctx.journal_mut());
+            // Nitro rejects calls to programs which were never activated, were activated for an
+            // older Stylus version, or have expired before preparing or running any WASM.
+            let program = ArbosState::open()
+                .programs
+                .read_program(code_hash, ctx.journal_mut())
+                .ok()?;
+            if let Err(
+                ProgramActivationError::NotActivated
+                | ProgramActivationError::NeedsUpgrade { .. }
+                | ProgramActivationError::Expired { .. },
+            ) = program.validate_active(
+                ctx.block().timestamp().saturating_to(),
+                params.version,
+                params.expiry_days,
+            ) {
+                return Some(InterpreterAction::Return(InterpreterResult {
+                    result: InstructionResult::InvalidFEOpcode,
+                    output: Bytes::new(),
+                    gas: Gas::new(gas_limit),
+                }));
+            }
+
             let wasm = match stylus_code(
                 &bytecode,
                 arbos_version,
@@ -136,14 +158,6 @@ where
                 Ok(None) => return None,
                 Err(err) => return Some(revert(gas_limit, err)),
             };
-
-            // Stored program metadata, Nitro's source of truth for init/page gas, set at
-            // activation. We still compile/activate below for the executable module, but charge
-            // gas from these stored values (re-deriving from the WASM can differ by a few units).
-            let program = ArbosState::open()
-                .programs
-                .read_program(code_hash, ctx.journal_mut())
-                .ok()?;
 
             // Fetch (or compile+activate, caching) the native module.
             let compile_config = CompileConfig::version(params.version, debug);
