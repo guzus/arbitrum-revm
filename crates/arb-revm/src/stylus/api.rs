@@ -65,6 +65,8 @@ impl RequestHandler<VecReader> for StylusHandler {
 const COLD_SLOAD_COST: u64 = 2100;
 const WARM_STORAGE_READ_COST: u64 = 100;
 const COLD_ACCOUNT_ACCESS_COST: u64 = 2600;
+const DEFAULT_MAX_CODE_SIZE: u64 = 24_576;
+const EXTCODE_SIZE_GAS: u64 = 700;
 const SSTORE_SET_GAS: u64 = 20_000;
 const SSTORE_RESET_GAS: u64 = 2900;
 
@@ -172,7 +174,8 @@ where
                         // Nitro charges this hostio from the guest-supplied budget. Once a
                         // slot cannot be paid, the entire budget is consumed and the program
                         // receives Failure before ArbOS 50 and OutOfGas afterwards.
-                        let status = set_trie_slots_exhausted_status(ctx.cfg().spec().arbos_version());
+                        let status =
+                            set_trie_slots_exhausted_status(ctx.cfg().spec().arbos_version());
                         return (vec![status as u8], empty_reader(), ArbGas(initial_gas));
                     }
                     gas_left -= cost;
@@ -186,7 +189,8 @@ where
                         .sstore_refund(eth_spec.is_enabled_in(SpecId::ISTANBUL), &load.data);
                     ctx.chain_mut().stylus_refund += refund;
                     if gas_left == 0 {
-                        let status = set_trie_slots_exhausted_status(ctx.cfg().spec().arbos_version());
+                        let status =
+                            set_trie_slots_exhausted_status(ctx.cfg().spec().arbos_version());
                         return (vec![status as u8], empty_reader(), ArbGas(initial_gas));
                     }
                 }
@@ -275,6 +279,43 @@ where
             (code_hash.0.to_vec(), empty_reader(), ArbGas(gas))
         }
 
+        // EXTCODECOPY/EXTCODESIZE: req = address(20) ++ gas_left(8) -> code reader + access gas.
+        // Both guest hostios use this request. The requestor caches the returned code, so a
+        // size-then-copy pair for one address only touches the account once.
+        EvmApiMethod::AccountCode if req_data.len() < 28 => malformed(),
+        EvmApiMethod::AccountCode => {
+            let address = Address::from_slice(&req_data[..20]);
+            let gas_left = u64::from_be_bytes(req_data[20..28].try_into().unwrap());
+            let is_cold = ctx
+                .journal_mut()
+                .load_account(address)
+                .map(|account| account.is_cold)
+                .unwrap_or(true);
+            let access_cost = if is_cold {
+                COLD_ACCOUNT_ACCESS_COST
+            } else {
+                WARM_STORAGE_READ_COST
+            };
+            // Nitro adds one EXTCODESIZE-era unit per configured maximum-code-size multiple.
+            let code_cost = (ctx.cfg().max_code_size() as u64 / DEFAULT_MAX_CODE_SIZE)
+                .saturating_mul(EXTCODE_SIZE_GAS);
+            let cost = access_cost.saturating_add(code_cost);
+
+            // Nitro warms the account and reports the full cost, but avoids loading its code when
+            // the guest cannot pay the worst-case access charge.
+            let code = if gas_left < cost {
+                Bytes::new()
+            } else {
+                ctx.journal_mut()
+                    .load_account_with_code(address)
+                    .ok()
+                    .and_then(|account| account.info.code.as_ref())
+                    .map(|code| code.original_bytes())
+                    .unwrap_or_default()
+            };
+            (Vec::new(), VecReader::new(code.to_vec()), ArbGas(cost))
+        }
+
         // `pay_for_memory_grow`: the WASM grew its memory beyond the program footprint. Mirrors
         // Nitro's `addPages` (api.go): bump the tx page counters first, then charge the memory
         // model's cost computed against the OLD open/ever values. The page-limit penalty branch
@@ -304,8 +345,8 @@ where
             (Vec::new(), empty_reader(), ArbGas(cost))
         }
 
-        // Not yet wired: account_code (returns code via the reader), capture, and
-        // the call/create family (handled by the executor's frame re-entry). TODO(stage 2).
+        // Not yet wired: capture. The call/create family is handled by the executor's frame
+        // re-entry rather than this state-only dispatcher.
         _ => (Vec::new(), empty_reader(), ArbGas(0)),
     };
     if debug {
@@ -322,7 +363,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{EvmApiStatus, set_trie_slots_exhausted_status};
+    use arbutil::evm::api::{DataReader, EvmApiMethod, EvmApiStatus};
+    use revm::{
+        Context, MainContext,
+        context::{BlockEnv, CfgEnv, TxEnv},
+        database::InMemoryDB,
+        primitives::{Address, Bytes, keccak256},
+        state::{AccountInfo, Bytecode},
+    };
+
+    use super::{handle_request, set_trie_slots_exhausted_status};
+    use crate::{ArbChainContext, ArbSpecId, ArbTransaction};
 
     #[test]
     fn set_trie_slots_exhaustion_is_version_gated() {
@@ -330,5 +381,86 @@ mod tests {
         assert_eq!(set_trie_slots_exhausted_status(49), EvmApiStatus::Failure);
         assert_eq!(set_trie_slots_exhausted_status(50), EvmApiStatus::OutOfGas);
         assert_eq!(set_trie_slots_exhausted_status(61), EvmApiStatus::OutOfGas);
+    }
+
+    #[test]
+    fn account_code_returns_code_and_charges_chain_maximum() {
+        const ACCOUNT: Address = Address::with_last_byte(0x52);
+        const ROBINHOOD_MAX_CODE_SIZE: usize = 98_304;
+        const COLD_COST: u64 = 2_600 + 4 * 700;
+        const WARM_COST: u64 = 100 + 4 * 700;
+
+        let code = Bytes::from_static(&[0x60, 0x01, 0x60, 0x02, 0x01, 0x00]);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            ACCOUNT,
+            AccountInfo {
+                code_hash: keccak256(&code),
+                code: Some(Bytecode::new_raw(code.clone())),
+                ..AccountInfo::default()
+            },
+        );
+
+        let mut cfg = CfgEnv::new_with_spec(ArbSpecId::ARBOS_51);
+        cfg.limit_contract_code_size = Some(ROBINHOOD_MAX_CODE_SIZE);
+        let mut ctx = Context::mainnet()
+            .with_tx(ArbTransaction::<TxEnv>::default())
+            .with_cfg(cfg)
+            .with_block(BlockEnv::default())
+            .with_chain(ArbChainContext::default())
+            .with_db(db);
+
+        let request = |gas_left: u64| {
+            let mut request = Vec::with_capacity(28);
+            request.extend_from_slice(ACCOUNT.as_slice());
+            request.extend_from_slice(&gas_left.to_be_bytes());
+            request
+        };
+
+        let (response, reader, gas) = handle_request(
+            &mut ctx,
+            Address::ZERO,
+            EvmApiMethod::AccountCode,
+            request(u64::MAX),
+        );
+        assert!(response.is_empty());
+        assert_eq!(reader.slice(), code.as_ref());
+        assert_eq!(gas.0, COLD_COST);
+
+        let (_, reader, gas) = handle_request(
+            &mut ctx,
+            Address::ZERO,
+            EvmApiMethod::AccountCode,
+            request(u64::MAX),
+        );
+        assert_eq!(reader.slice(), code.as_ref());
+        assert_eq!(gas.0, WARM_COST);
+
+        // Nitro reports and warms for the full worst-case cost, but does not fetch the code when
+        // the guest's remaining budget cannot cover it.
+        const UNFUNDED: Address = Address::with_last_byte(0x53);
+        let mut insufficient_request = Vec::with_capacity(28);
+        insufficient_request.extend_from_slice(UNFUNDED.as_slice());
+        insufficient_request.extend_from_slice(&(COLD_COST - 1).to_be_bytes());
+        let (_, reader, gas) = handle_request(
+            &mut ctx,
+            Address::ZERO,
+            EvmApiMethod::AccountCode,
+            insufficient_request,
+        );
+        assert!(reader.slice().is_empty());
+        assert_eq!(gas.0, COLD_COST);
+
+        let mut warmed_request = Vec::with_capacity(28);
+        warmed_request.extend_from_slice(UNFUNDED.as_slice());
+        warmed_request.extend_from_slice(&u64::MAX.to_be_bytes());
+        let (_, reader, gas) = handle_request(
+            &mut ctx,
+            Address::ZERO,
+            EvmApiMethod::AccountCode,
+            warmed_request,
+        );
+        assert!(reader.slice().is_empty());
+        assert_eq!(gas.0, WARM_COST);
     }
 }

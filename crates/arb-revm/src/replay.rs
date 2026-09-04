@@ -21,17 +21,19 @@ use std::collections::BTreeMap;
 
 use arbitrum_alloy_rpc_types::ArbTransaction as RpcArbTransaction;
 use revm::{
+    DatabaseRef, ExecuteCommitEvm, ExecuteEvm,
     context::{BlockEnv, CfgEnv, TxEnv},
     database::CacheDB,
-    primitives::{Address, Bytes, StorageKey, StorageValue, B256, KECCAK_EMPTY, U256},
+    primitives::{Address, B256, Bytes, KECCAK_EMPTY, StorageKey, StorageValue, U256},
     state::{AccountInfo, Bytecode, EvmState},
-    DatabaseRef, ExecuteCommitEvm, ExecuteEvm,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    transaction::arb_envelope_to_tx_env, ArbBuilder, ArbChainContext, ArbContext, ArbSpecId,
-    ArbTransaction, DefaultArb,
+    ArbBuilder, ArbChainContext, ArbContext, ArbSpecId, ArbTransaction, DefaultArb,
+    constants::ARBOS_STATE_ADDRESS,
+    storage::{max_code_size_from_serialized_config, read_serialized_chain_config},
+    transaction::arb_envelope_to_tx_env,
 };
 
 /// Current on-disk fixture schema identifier.
@@ -365,6 +367,12 @@ pub fn replay_fixture(fixture: &ReplayFixture) -> ReplayReport {
     cfg_env.disable_eip3541 = spec.is_enabled_in(ArbSpecId::ARBOS_30);
     // Nitro exempts Arbitrum from the EIP-7825 per-tx gas cap (Osaka / ArbOS 50+); match it.
     cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+    let serialized_chain_config = read_serialized_chain_config(|slot| {
+        db.storage_ref(ARBOS_STATE_ADDRESS, slot.into())
+            .unwrap_or_default()
+    });
+    cfg_env.limit_contract_code_size =
+        max_code_size_from_serialized_config(&serialized_chain_config);
 
     let chain = ArbChainContext::new(None).with_l1_block_number(fixture.block.l1_block_number);
     let context: ArbContext<&mut _> = ArbContext::arb_with_chain_context(chain)

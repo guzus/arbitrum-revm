@@ -1,5 +1,6 @@
 use eyre::Result;
 use revm::primitives::{B256, U256};
+use serde::Deserialize;
 
 use super::{StorageBytes, StorageSpace, Subspace};
 use crate::arb_journal::ArbJournal;
@@ -36,6 +37,29 @@ pub fn read_serialized_chain_config(mut read_slot: impl FnMut(B256) -> U256) -> 
     out
 }
 
+/// Reads Nitro's optional `arbitrum.MaxCodeSize` override from a serialized chain config.
+/// Missing or zero means the chain uses Ethereum's default EIP-170 limit.
+pub fn max_code_size_from_serialized_config(config: &[u8]) -> Option<usize> {
+    #[derive(Deserialize)]
+    struct ChainConfig {
+        arbitrum: Option<ArbitrumConfig>,
+    }
+
+    #[derive(Deserialize)]
+    struct ArbitrumConfig {
+        #[serde(rename = "MaxCodeSize", default)]
+        max_code_size: u64,
+    }
+
+    let max_code_size = serde_json::from_slice::<ChainConfig>(config)
+        .ok()?
+        .arbitrum?
+        .max_code_size;
+    (max_code_size != 0)
+        .then(|| usize::try_from(max_code_size).ok())
+        .flatten()
+}
+
 /// ArbOS chain-config blob storage.
 #[derive(Debug)]
 pub struct ChainConfig {
@@ -63,5 +87,25 @@ impl ChainConfig {
 
     pub fn size<J: ArbJournal>(&self, journal: &mut J) -> Result<u64> {
         self.bytes.size(journal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::max_code_size_from_serialized_config;
+
+    #[test]
+    fn reads_optional_max_code_size() {
+        assert_eq!(
+            max_code_size_from_serialized_config(
+                br#"{"chainId":4663,"arbitrum":{"MaxCodeSize":98304}}"#,
+            ),
+            Some(98_304)
+        );
+        assert_eq!(
+            max_code_size_from_serialized_config(br#"{"arbitrum":{"MaxCodeSize":0}}"#),
+            None
+        );
+        assert_eq!(max_code_size_from_serialized_config(b"{}"), None);
     }
 }

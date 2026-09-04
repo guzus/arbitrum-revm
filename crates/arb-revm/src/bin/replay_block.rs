@@ -16,12 +16,16 @@ use arb_revm::replay::{
     RecordingDb, ReplayFixture, StorageEntry,
 };
 use arb_revm::transaction::arb_envelope_to_tx_env;
-use arb_revm::{ArbBuilder, ArbChainContext, ArbContext, ArbSpecId, ArbTransaction, DefaultArb};
+use arb_revm::{
+    ArbBuilder, ArbChainContext, ArbContext, ArbSpecId, ArbTransaction, DefaultArb,
+    constants::ARBOS_STATE_ADDRESS,
+    storage::{max_code_size_from_serialized_config, read_serialized_chain_config},
+};
 use arbitrum_alloy_network::Arbitrum;
 use arbitrum_alloy_rpc_types::{ArbTransaction as RpcArbTransaction, ArbTransactionReceipt};
 use eyre::{Result, eyre};
 use revm::{
-    ExecuteCommitEvm, ExecuteEvm,
+    DatabaseRef, ExecuteCommitEvm, ExecuteEvm,
     bytecode::opcode::OpCode,
     context::{BlockEnv, CfgEnv, TxEnv},
     database::CacheDB,
@@ -953,6 +957,12 @@ async fn main() -> Result<()> {
     cfg_env.disable_eip3541 = spec.is_enabled_in(ArbSpecId::ARBOS_30);
     // Nitro exempts Arbitrum from the EIP-7825 per-tx gas cap (Osaka / ArbOS 50+); match it.
     cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+    let serialized_chain_config = read_serialized_chain_config(|slot| {
+        db.storage_ref(ARBOS_STATE_ADDRESS, slot.into())
+            .unwrap_or_default()
+    });
+    cfg_env.limit_contract_code_size =
+        max_code_size_from_serialized_config(&serialized_chain_config);
 
     // --trace-tx <idx>: run with an opcode/call-frequency inspector and dump what the
     // engine does for tx[idx] (diagnosing gas-divergence). Earlier txs build up state.

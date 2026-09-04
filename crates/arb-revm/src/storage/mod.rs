@@ -29,7 +29,9 @@ pub use arbos_state::{ArbBlockHeaderInfo, ArbosState};
 pub use batch_poster_table::{BatchPosterState, BatchPosterTable};
 pub use block_hashes::BlockHashes;
 pub use bytes::StorageBytes;
-pub use chain_config::{ChainConfig, read_serialized_chain_config};
+pub use chain_config::{
+    ChainConfig, max_code_size_from_serialized_config, read_serialized_chain_config,
+};
 pub use features::{ArbFeatures, FEATURE_INCREASED_CALLDATA_PRICE};
 pub use l1_pricing::L1Pricing;
 pub use l2_pricing::L2Pricing;
