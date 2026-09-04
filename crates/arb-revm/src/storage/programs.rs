@@ -125,6 +125,49 @@ pub struct ProgramInfo {
     pub cached: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProgramActivationError {
+    NotActivated,
+    NeedsUpgrade { version: u16, stylus_version: u16 },
+    Expired { age: u64 },
+}
+
+impl ProgramInfo {
+    fn age_seconds(self, timestamp: u64) -> u64 {
+        let activated_at =
+            ARBITRUM_START_TIME.saturating_add(u64::from(self.activated_at).saturating_mul(3600));
+        timestamp.saturating_sub(activated_at)
+    }
+
+    pub(crate) fn validate_active(
+        self,
+        timestamp: u64,
+        stylus_version: u16,
+        expiry_days: u16,
+    ) -> Result<(), ProgramActivationError> {
+        if self.version == 0 {
+            return Err(ProgramActivationError::NotActivated);
+        }
+        if self.version != stylus_version {
+            return Err(ProgramActivationError::NeedsUpgrade {
+                version: self.version,
+                stylus_version,
+            });
+        }
+
+        let age = self.age_seconds(timestamp);
+        if age > u64::from(expiry_days).saturating_mul(24 * 60 * 60) {
+            return Err(ProgramActivationError::Expired { age });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_expired(self, timestamp: u64, expiry_days: u16) -> bool {
+        self.activated_at == 0
+            || self.age_seconds(timestamp) > u64::from(expiry_days).saturating_mul(24 * 60 * 60)
+    }
+}
+
 /// Typed view over ArbOS Programs substorage roots.
 #[derive(Debug)]
 pub struct ArbosPrograms {
@@ -543,6 +586,43 @@ mod tests {
             serialized_chain_config: b"{\"chainId\":412346}".to_vec(),
             debug_precompiles: false,
         }
+    }
+
+    #[test]
+    fn active_program_validation_matches_nitro_boundaries() {
+        let activated_at = 100_u32;
+        let activation_time = ARBITRUM_START_TIME + u64::from(activated_at) * 3600;
+        let program = ProgramInfo {
+            version: 2,
+            activated_at,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ProgramInfo::default().validate_active(activation_time, 2, 1),
+            Err(ProgramActivationError::NotActivated)
+        );
+        assert_eq!(
+            program.validate_active(activation_time, 3, 1),
+            Err(ProgramActivationError::NeedsUpgrade {
+                version: 2,
+                stylus_version: 3,
+            })
+        );
+        assert_eq!(
+            program.validate_active(activation_time + 24 * 60 * 60, 2, 1),
+            Ok(()),
+            "the exact expiry boundary remains active"
+        );
+        assert_eq!(
+            program.validate_active(activation_time + 24 * 60 * 60 + 1, 2, 1),
+            Err(ProgramActivationError::Expired {
+                age: 24 * 60 * 60 + 1,
+            })
+        );
+        assert!(!program.is_expired(activation_time + 24 * 60 * 60, 1));
+        assert!(program.is_expired(activation_time + 24 * 60 * 60 + 1, 1));
+        assert!(ProgramInfo::default().is_expired(activation_time, 1));
     }
 
     /// After `programs.initialize(30, ..)` the packed params word must have

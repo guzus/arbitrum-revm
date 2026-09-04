@@ -307,6 +307,14 @@ pub fn cache_program(
     cache.get_or_insert(code_hash, || (serialized, module, stylus_data));
 }
 
+/// Drops every process-local compiled representation for a program. Activation metadata is
+/// versioned in ArbOS state, while these caches are keyed only by code hash, so reactivation must
+/// evict the old entry before the new Stylus version can execute.
+pub fn evict_program(code_hash: B256) {
+    PROGRAM_CACHE.lock().unwrap().pop(&code_hash);
+    CRANELIFT_CACHE.lock().unwrap().pop(&code_hash);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +393,26 @@ mod tests {
         let second = cranelift_program(code_hash, &wasm, &config).expect("cached program");
         assert_eq!(first, second);
         assert!(!first.is_empty());
+    }
+
+    #[test]
+    fn reactivation_evicts_all_compiled_program_entries() {
+        let wasm = minimal_stylus_wasm();
+        let config = CompileConfig::version(3, false);
+        let code_hash = B256::repeat_byte(0x6b);
+        let serialized = stylus_compile(&wasm, &config).expect("compile program");
+        let (module, data) =
+            stylus_activate(None, &wasm, code_hash, 61, 3, 128, false).expect("activate program");
+
+        cache_program(code_hash, serialized, module, data);
+        cranelift_program(code_hash, &wasm, &config).expect("compile cranelift program");
+        assert!(PROGRAM_CACHE.lock().unwrap().peek(&code_hash).is_some());
+        assert!(CRANELIFT_CACHE.lock().unwrap().peek(&code_hash).is_some());
+
+        evict_program(code_hash);
+
+        assert!(PROGRAM_CACHE.lock().unwrap().peek(&code_hash).is_none());
+        assert!(CRANELIFT_CACHE.lock().unwrap().peek(&code_hash).is_none());
     }
 
     #[test]
