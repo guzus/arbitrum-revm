@@ -19,7 +19,7 @@ use std::{
 /// values this instance compiled against. That is the cache key: code hash plus this
 /// immutable instance context (ArbOS spec, eth spec, target, compiler, runtime, gas).
 pub const COMPILER_IDENTITY: &str =
-    "revmc-llvm/in-process-owned-jit/gas-metered/single-error-off/stack-checks-on";
+    "revmc-llvm/in-process-owned-jit/llvm-o3/gas-metered/single-error-off/stack-checks-on";
 
 /// Failure from constructing a registry or compiling a program.
 #[derive(Debug)]
@@ -99,6 +99,8 @@ impl CompiledFrameRegistry {
         let gas_params = GasParams::new_spec(eth_spec);
         let mut compiler = EvmCompiler::new_llvm(false)
             .map_err(|err| CompiledFrameError::Compiler(err.to_string()))?;
+        // Isolated O3 experiment: change optimizer/codegen level only.
+        compiler.set_opt_level(revmc::OptimizationLevel::Aggressive);
         compiler.set_module_name("arb-compiled-frame");
         compiler.set_dump_to(None);
         compiler.dump_assembly(false);

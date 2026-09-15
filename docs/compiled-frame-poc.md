@@ -139,3 +139,20 @@ so the module outlives dispatch.
   CALL stipend = GAS, reverted-child resume, initcode skip, miss, spec
   mismatch, PUSH-immediate exclusion, and the 256-opcode instruction-table
   diff. They are not a replay corpus. No whole-block speed claim.
+
+## Isolated LLVM O3 experiment
+
+Branch `codex/compiled-frame-o3` changes the reviewed5c00135 compiled-frame
+registry to `OptimizationLevel::Aggressive`. Pinned revmc79e3c8c maps this to
+LLVM O3 code generation and `default<O3>` module passes; its Default level uses
+O2 code generation with a custom pass pipeline (including a basic-block-count
+condition for LICM). This is not merely a Cargo release-profile change.
+
+Compiler identity includes `llvm-o3`. Gas metering, exact halt reasons, stack
+bounds, opcode eligibility and context/gas-table guards remain unchanged.
+Unset `REVMC_PASSES` for comparisons because upstream allows that environment
+variable to override the module pass pipeline; the paired runner already uses
+a sanitized environment that excludes it. Match source, fixtures, feature flags
+and CPU except this candidate change. Run full parity before paired performance
+measurements and report cold compile time separately. No performance or
+production qualification is implied by this experimental branch.
