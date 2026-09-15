@@ -1,7 +1,7 @@
-//! Conservative compile eligibility. Decoding skips PUSH (and other) immediates.
+//! Conservative compile eligibility. Legacy decoding skips only PUSH immediates.
 
 use crate::evm::{ARB_INSTRUCTION_OVERRIDES, COMPILED_HOST_BRIDGED_OVERRIDES};
-use revm::bytecode::opcode::OPCODE_INFO;
+use revm::bytecode::opcode;
 
 /// Why a bytecode image is refused for compilation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,10 +24,11 @@ pub enum IneligibleReason {
 
 /// Returns `Some` when `code` must not be compiled.
 ///
-/// Immediate bytes of `PUSH1..=PUSH32` (and any other opcode with an immediate) are
-/// skipped so a `PUSH1 0x43` does **not** count as `NUMBER`. Table overrides are
-/// refused unless they are explicitly host-bridged; adding an `insert_instruction`
-/// without classifying it fails closed (ineligible), not open.
+/// Skip only legacy PUSH1..PUSH32 payloads. Future/EOF immediate metadata must
+/// not hide an override after a legacy jump destination. Declared table overrides
+/// are refused unless explicitly host-bridged. A new insert_instruction missing
+/// from the declaration fails the table-diff test, not a runtime table inspection.
+/// This prototype supports constructor-produced, unmodified instruction tables.
 pub fn bytecode_ineligible(code: &[u8]) -> Option<IneligibleReason> {
     if code.is_empty() {
         return Some(IneligibleReason::Empty);
@@ -43,9 +44,11 @@ pub fn bytecode_ineligible(code: &[u8]) -> Option<IneligibleReason> {
         {
             return Some(IneligibleReason::InstructionOverride(op));
         }
-        let immediate = OPCODE_INFO[op as usize]
-            .map(|info| info.immediate_size() as usize)
-            .unwrap_or(0);
+        let immediate = if (opcode::PUSH1..=opcode::PUSH32).contains(&op) {
+            usize::from(op - opcode::PUSH1 + 1)
+        } else {
+            0
+        };
         i = i.saturating_add(1).saturating_add(immediate);
     }
     None
@@ -55,6 +58,20 @@ pub fn bytecode_ineligible(code: &[u8]) -> Option<IneligibleReason> {
 mod tests {
     use super::{IneligibleReason, bytecode_ineligible};
     use revm::bytecode::opcode;
+
+    #[test]
+    fn non_push_immediates_cannot_hide_refused_legacy_opcodes() {
+        for prefix in [0xe0, 0xe1, 0xe6, 0xe7, 0xe8] {
+            assert_eq!(
+                bytecode_ineligible(&[prefix, opcode::JUMPDEST, opcode::BLOCKHASH]),
+                Some(IneligibleReason::InstructionOverride(opcode::BLOCKHASH))
+            );
+            assert_eq!(
+                bytecode_ineligible(&[prefix, opcode::BLOCKHASH]),
+                Some(IneligibleReason::InstructionOverride(opcode::BLOCKHASH))
+            );
+        }
+    }
 
     #[test]
     fn empty_and_ef_prefix_are_ineligible() {

@@ -172,3 +172,21 @@ so the module outlives dispatch.
   compiled NUMBER, NUMBER after compiled resume, original `BlockEnv`
   unchanged, and BLOCKHASH still refused. They are not a replay corpus.
   No whole-block speed claim.
+
+
+### NUMBER review reconciliation
+
+Independent Claude review found no blocking adapter defect. Parent matched all
+30 pinned Host method names against the wrapper (including default methods),
+confirmed only NUMBER/BLOCKHASH builtins read Host.block_number, and inspected
+call_with_interpreter_inner: its EvmContext is local; only gas/action/resume
+state is stored back, with no retained host pointer. NUMBER's interpreter reads
+chain.l1_block_number without a version branch and costs2 gas. The scope remains
+constructor-produced, unmodified instruction tables; public post-construction
+customization is unsupported by this compiled prototype. The table audit is a
+test gate, not runtime inspection. Documentation now states that accurately.
+
+The eligibility scanner now skips only legacy PUSH payloads, avoiding dependence
+on future or EOF multi-byte immediate metadata. A regression test ensures such
+prefixes cannot hide BLOCKHASH. STATICCALL/DELEGATECALL and upgrade-block corpus
+coverage remain incomplete; these tests do not authorize production enablement.
