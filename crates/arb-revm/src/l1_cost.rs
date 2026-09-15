@@ -216,6 +216,49 @@ pub fn encode_tx_bytes<T: ArbTxTr>(tx: &T) -> Vec<u8> {
     encode_tx_for_l1_cost(tx)
 }
 
+/// Immutable, opaque compression result prepared independently of EVM state.
+///
+/// Only successful compression is retained. It owns the exact encoded input;
+/// consuming it still checks bytes and the actual requested compression settings.
+/// No fee, price, transaction index, journal state or process-global cache is stored.
+pub struct PreparedPosterCompression {
+    tx_bytes: Box<[u8]>,
+    brotli_level: u32,
+    window_size: u32,
+    dictionary: brotli::Dictionary,
+    compressed_len: u64,
+}
+
+impl PreparedPosterCompression {
+    /// Prepare canonical bytes returned by `encode_tx_bytes` (or its exact fallback).
+    /// Workers should skip empty/system transactions and bound retained input bytes.
+    /// Compression failures are returned, never memoized as successful fallback lengths.
+    pub fn prepare(
+        tx_bytes: &[u8],
+        brotli_level: u32,
+        window_size: u32,
+        dictionary: brotli::Dictionary,
+    ) -> Result<Self, brotli::BrotliStatus> {
+        let compressed_len =
+            brotli::compress(tx_bytes, brotli_level, window_size, dictionary)?.len() as u64;
+        Ok(Self {
+            tx_bytes: tx_bytes.into(),
+            brotli_level,
+            window_size,
+            dictionary,
+            compressed_len,
+        })
+    }
+
+    fn compressed_len_for(&self, tx_bytes: &[u8], brotli_level: u32) -> Option<u64> {
+        (self.brotli_level == brotli_level
+            && self.window_size == brotli::DEFAULT_WINDOW_SIZE
+            && self.dictionary == brotli::Dictionary::Empty
+            && self.tx_bytes.as_ref() == tx_bytes)
+            .then_some(self.compressed_len)
+    }
+}
+
 /// Computes L1 poster cost information from pre-encoded transaction bytes.
 ///
 /// `tx_bytes`, result of `encode_tx_bytes(tx)` (empty → no cost).
@@ -230,6 +273,29 @@ pub fn compute_poster_info(
     gas_price: U256,
     brotli_level: u32,
 ) -> PosterInfo {
+    compute_poster_info_with_prepared(
+        tx_bytes,
+        coinbase,
+        price_per_unit,
+        gas_price,
+        brotli_level,
+        None,
+    )
+}
+
+/// Opt-in poster-cost calculation using a prepared compression result when exact.
+///
+/// Call after reading the current compression level and fee inputs from serial
+/// execution state. Missing/mismatched preparation takes the existing synchronous
+/// compression path. This function does not schedule work or mutate execution state.
+pub fn compute_poster_info_with_prepared(
+    tx_bytes: &[u8],
+    coinbase: revm::primitives::Address,
+    price_per_unit: U256,
+    gas_price: U256,
+    brotli_level: u32,
+    prepared: Option<&PreparedPosterCompression>,
+) -> PosterInfo {
     let zero = PosterInfo {
         poster_cost: U256::ZERO,
         calldata_units: 0,
@@ -242,21 +308,30 @@ pub fn compute_poster_info(
         return zero;
     }
 
-    // Brotli-compress the tx bytes at the chain's configured level.
-    let compressed = brotli::compress(
+    let compressed_len = prepared
+        .and_then(|item| item.compressed_len_for(tx_bytes, brotli_level))
+        .unwrap_or_else(|| compressed_len_or_fallback(tx_bytes, brotli_level));
+    poster_info_from_compressed_len(compressed_len, price_per_unit, gas_price)
+}
+
+fn compressed_len_or_fallback(tx_bytes: &[u8], brotli_level: u32) -> u64 {
+    match brotli::compress(
         tx_bytes,
         brotli_level,
         brotli::DEFAULT_WINDOW_SIZE,
         brotli::Dictionary::Empty,
-    );
-    let compressed_len = match compressed {
-        Ok(ref v) => v.len() as u64,
-        Err(_) => {
-            // Nitro panics here; we fall back to uncompressed length.
-            tx_bytes.len() as u64
-        }
-    };
+    ) {
+        Ok(value) => value.len() as u64,
+        // Preserve the existing fallback (Nitro panics here).
+        Err(_) => tx_bytes.len() as u64,
+    }
+}
 
+fn poster_info_from_compressed_len(
+    compressed_len: u64,
+    price_per_unit: U256,
+    gas_price: U256,
+) -> PosterInfo {
     // calldataUnits = TxDataNonZeroGasEIP2028 * compressed_len = 16 * compressed_len
     const TX_DATA_NON_ZERO_GAS: u64 = 16;
     let calldata_units = TX_DATA_NON_ZERO_GAS.saturating_mul(compressed_len);
@@ -284,11 +359,276 @@ pub fn compute_poster_info(
 
 #[cfg(test)]
 mod tests {
-    use super::tx_type_has_poster_costs;
+    use super::*;
     use crate::constants::{
         ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_RETRY_TX_TYPE,
         ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE,
     };
+
+    fn prepare(bytes: &[u8], level: u32) -> PreparedPosterCompression {
+        PreparedPosterCompression::prepare(
+            bytes,
+            level,
+            brotli::DEFAULT_WINDOW_SIZE,
+            brotli::Dictionary::Empty,
+        )
+        .unwrap()
+    }
+
+    fn assert_same(left: PosterInfo, right: PosterInfo) {
+        assert_eq!(left.calldata_units, right.calldata_units);
+        assert_eq!(left.poster_cost, right.poster_cost);
+        assert_eq!(left.poster_gas, right.poster_gas);
+        assert_eq!(left.poster_fee, right.poster_fee);
+    }
+
+    #[test]
+    fn exact_preparation_matches_direct_compression_and_current_fees() {
+        for level in [0, 1, 4] {
+            let bytes = vec![42; 512];
+            let prepared = prepare(&bytes, level);
+            let direct = brotli::compress(
+                &bytes,
+                level,
+                brotli::DEFAULT_WINDOW_SIZE,
+                brotli::Dictionary::Empty,
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.compressed_len_for(&bytes, level),
+                Some(direct.len() as u64)
+            );
+            for (price, gas) in [
+                (U256::from(100), U256::from(3)),
+                (U256::from(7), U256::from(2)),
+                (U256::MAX, U256::from(1)),
+            ] {
+                let info = compute_poster_info_with_prepared(
+                    &bytes,
+                    BATCH_POSTER_ADDRESS,
+                    price,
+                    gas,
+                    level,
+                    Some(&prepared),
+                );
+                assert_eq!(info.calldata_units, 16 * direct.len() as u64);
+                assert_eq!(
+                    info.poster_cost,
+                    price.saturating_mul(U256::from(info.calldata_units))
+                );
+                assert_eq!(
+                    info.poster_gas,
+                    u64::try_from(info.poster_cost / gas).unwrap_or(u64::MAX)
+                );
+                assert_same(
+                    info,
+                    compute_poster_info(&bytes, BATCH_POSTER_ADDRESS, price, gas, level),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changed_level_and_changed_bytes_fall_back() {
+        let mut bytes = vec![42; 512];
+        let prepared = prepare(&bytes, 0);
+        assert!(prepared.compressed_len_for(&bytes, 1).is_none());
+        assert_same(
+            compute_poster_info_with_prepared(
+                &bytes,
+                BATCH_POSTER_ADDRESS,
+                U256::from(7),
+                U256::from(3),
+                1,
+                Some(&prepared),
+            ),
+            compute_poster_info(
+                &bytes,
+                BATCH_POSTER_ADDRESS,
+                U256::from(7),
+                U256::from(3),
+                1,
+            ),
+        );
+        bytes[0] = 99;
+        assert!(prepared.compressed_len_for(&bytes, 0).is_none());
+        assert_same(
+            compute_poster_info_with_prepared(
+                &bytes,
+                BATCH_POSTER_ADDRESS,
+                U256::from(7),
+                U256::from(3),
+                0,
+                Some(&prepared),
+            ),
+            compute_poster_info(
+                &bytes,
+                BATCH_POSTER_ADDRESS,
+                U256::from(7),
+                U256::from(3),
+                0,
+            ),
+        );
+        bytes.push(0);
+        assert!(prepared.compressed_len_for(&bytes, 0).is_none());
+    }
+
+    #[test]
+    fn window_and_dictionary_are_part_of_the_key() {
+        let bytes = b"poster compression input";
+        let different_window = PreparedPosterCompression::prepare(
+            bytes,
+            1,
+            brotli::DEFAULT_WINDOW_SIZE - 1,
+            brotli::Dictionary::Empty,
+        )
+        .unwrap();
+        assert!(different_window.compressed_len_for(bytes, 1).is_none());
+        let different_dictionary = PreparedPosterCompression::prepare(
+            bytes,
+            11,
+            brotli::DEFAULT_WINDOW_SIZE,
+            brotli::Dictionary::StylusProgram,
+        )
+        .unwrap();
+        assert!(different_dictionary.compressed_len_for(bytes, 11).is_none());
+        for (prepared, level) in [(&different_window, 1), (&different_dictionary, 11)] {
+            assert_same(
+                compute_poster_info_with_prepared(
+                    bytes,
+                    BATCH_POSTER_ADDRESS,
+                    U256::from(7),
+                    U256::from(3),
+                    level,
+                    Some(prepared),
+                ),
+                compute_poster_info(
+                    bytes,
+                    BATCH_POSTER_ADDRESS,
+                    U256::from(7),
+                    U256::from(3),
+                    level,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_errors_are_not_successful_memo_entries() {
+        // Vendored Brotli explicitly rejects the Stylus dictionary below level 11.
+        assert!(
+            PreparedPosterCompression::prepare(
+                b"input",
+                1,
+                brotli::DEFAULT_WINDOW_SIZE,
+                brotli::Dictionary::StylusProgram
+            )
+            .is_err()
+        );
+        assert_same(
+            compute_poster_info_with_prepared(
+                b"input",
+                BATCH_POSTER_ADDRESS,
+                U256::from(7),
+                U256::from(3),
+                1,
+                None,
+            ),
+            compute_poster_info(
+                b"input",
+                BATCH_POSTER_ADDRESS,
+                U256::from(7),
+                U256::from(3),
+                1,
+            ),
+        );
+    }
+
+    #[test]
+    fn empty_and_nonposter_inputs_still_have_zero_cost() {
+        let prepared = prepare(b"input", 1);
+        for (bytes, coinbase) in [
+            (b"".as_slice(), BATCH_POSTER_ADDRESS),
+            (b"input".as_slice(), revm::primitives::Address::ZERO),
+        ] {
+            let info = compute_poster_info_with_prepared(
+                bytes,
+                coinbase,
+                U256::from(7),
+                U256::from(3),
+                1,
+                Some(&prepared),
+            );
+            assert_eq!(info.calldata_units, 0);
+            assert_eq!(info.poster_cost, U256::ZERO);
+            assert_eq!(info.poster_gas, 0);
+            assert_eq!(info.poster_fee, U256::ZERO);
+        }
+    }
+
+    #[test]
+    fn zero_prices_preserve_units_and_fee_edge_cases() {
+        let bytes = b"input";
+        let prepared = prepare(bytes, 1);
+        let zero_price = compute_poster_info_with_prepared(
+            bytes,
+            BATCH_POSTER_ADDRESS,
+            U256::ZERO,
+            U256::from(3),
+            1,
+            Some(&prepared),
+        );
+        assert!(zero_price.calldata_units > 0);
+        assert_eq!(zero_price.poster_cost, U256::ZERO);
+        let zero_gas = compute_poster_info_with_prepared(
+            bytes,
+            BATCH_POSTER_ADDRESS,
+            U256::from(7),
+            U256::ZERO,
+            1,
+            Some(&prepared),
+        );
+        assert_eq!(zero_gas.calldata_units, zero_price.calldata_units);
+        assert!(zero_gas.poster_cost > U256::ZERO);
+        assert_eq!(zero_gas.poster_gas, 0);
+        assert_eq!(zero_gas.poster_fee, U256::ZERO);
+    }
+
+    #[test]
+    fn canonical_fallback_and_system_bytes_use_existing_encoder() {
+        use crate::transaction::ArbTransaction;
+        use revm::context::TxEnv;
+        let mut tx = ArbTransaction::new(TxEnv::default());
+        let fallback = encode_tx_bytes(&tx);
+        assert!(!fallback.is_empty());
+        let prepared = prepare(&fallback, 1);
+        tx.encoded_2718 = Some(vec![1, 2, 3, 4].into());
+        let canonical = encode_tx_bytes(&tx);
+        assert_eq!(canonical, [1, 2, 3, 4]);
+        assert!(prepared.compressed_len_for(&canonical, 1).is_none());
+        for ty in [
+            ARBITRUM_INTERNAL_TX_TYPE,
+            ARBITRUM_DEPOSIT_TX_TYPE,
+            ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE,
+            ARBITRUM_RETRY_TX_TYPE,
+        ] {
+            tx.base.tx_type = ty;
+            let bytes = encode_tx_bytes(&tx);
+            assert!(bytes.is_empty());
+            assert_eq!(
+                compute_poster_info_with_prepared(
+                    &bytes,
+                    BATCH_POSTER_ADDRESS,
+                    U256::from(7),
+                    U256::from(3),
+                    1,
+                    Some(&prepared)
+                )
+                .calldata_units,
+                0
+            );
+        }
+    }
 
     #[test]
     fn protocol_transactions_never_have_l1_poster_costs() {
