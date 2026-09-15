@@ -227,6 +227,19 @@ pub struct PreparedPosterCompression {
     window_size: u32,
     dictionary: brotli::Dictionary,
     compressed_len: u64,
+    hits: std::sync::atomic::AtomicU64,
+}
+
+impl core::fmt::Debug for PreparedPosterCompression {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedPosterCompression")
+            .field("encoded_len", &self.tx_bytes.len())
+            .field("brotli_level", &self.brotli_level)
+            .field("window_size", &self.window_size)
+            .field("dictionary", &self.dictionary)
+            .field("compressed_len", &self.compressed_len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PreparedPosterCompression {
@@ -247,7 +260,13 @@ impl PreparedPosterCompression {
             window_size,
             dictionary,
             compressed_len,
+            hits: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Successful exact-match consumptions. Diagnostic only; never consulted for fees.
+    pub fn hit_count(&self) -> u64 {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn compressed_len_for(&self, tx_bytes: &[u8], brotli_level: u32) -> Option<u64> {
@@ -255,7 +274,10 @@ impl PreparedPosterCompression {
             && self.window_size == brotli::DEFAULT_WINDOW_SIZE
             && self.dictionary == brotli::Dictionary::Empty
             && self.tx_bytes.as_ref() == tx_bytes)
-            .then_some(self.compressed_len)
+            .then(|| {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.compressed_len
+            })
     }
 }
 
