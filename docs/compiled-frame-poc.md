@@ -55,7 +55,9 @@ The handler loop calls `frame_run` for every frame, so nested CALLs are checked.
 
 A whole-replay speedup claim **must not** count cold compile. Warm the eligible
 set first, then measure ArbOS message/block replay wall time against the
-interpreter baseline.
+interpreter baseline. Enabling NUMBER increases the eligible set (parent
+witness notes on the order of 10 NUMBER-refused images); whether that moves
+whole-replay time is a parent measurement, not a result of this adapter.
 
 ## Eligibility / coverage
 
@@ -63,8 +65,12 @@ Compiled only when **all** of these hold:
 
 - runtime call frame (not `CREATE` / initcode, not empty frame)
 - bytecode does not start with `0xEF` (EOF / Stylus)
-- bytecode does not contain `NUMBER` or `BLOCKHASH` after skipping PUSH
-  immediates (ArbOS L1 overrides differ from revmc builtins)
+- bytecode does not contain a refused instruction-table override after
+  skipping PUSH immediates. `BLOCKHASH` is refused. `NUMBER` is allowed:
+  a compiled-only Host adapter makes revmc's `Host::block_number()` return
+  `chain().l1_block_number` without writing `BlockEnv`. Any new
+  `insert_instruction` must be classified as refused or host-bridged;
+  unclassified overrides fail closed (ineligible).
 - code hash is already in the registry
 - live `ArbSpecId` and `GasParams` match the instance that compiled the program
 
@@ -76,10 +82,25 @@ on the interpreter table and does **not** call `frame_run`. Compiled dispatch
 is skipped under `inspect_*`; traces always show the interpreter.
 
 `ArbContext` does not implement `Host`. Stock `Context` `Host` methods are L2
-(`block_number`, `block_hash`). NUMBER/BLOCKHASH are **instruction-table**
-overrides, which compiled code never sees. revmc builtins go through `Host`,
-so those two opcodes are denylisted. Other env opcodes (COINBASE, DIFFICULTY,
-GASPRICE, …) share `Host` with the interpreter and are not overridden.
+(`block_number`, `block_hash`). NUMBER and BLOCKHASH are **instruction-table**
+overrides, which compiled code never sees. revmc builtins go through `Host`.
+
+NUMBER is served by a stack-local compiled Host adapter used only inside
+`call_with_interpreter`. It overrides `block_number()` to the L1 value copied
+from `chain().l1_block_number` and forwards every other Host method to the
+original context, including trait-default methods (`sstore`, `sload`,
+`balance`, `load_account_delegated`, `load_account_code`,
+`load_account_code_hash`) so an inner override is not replaced by the default.
+The real `BlockEnv` is not written.
+
+BLOCKHASH stays ineligible. `__revmc_builtin_blockhash` (pinned revmc
+`79e3c8ca`) does `host.block_number().checked_sub(requested)`, accepts only
+diff in `(0, 256]`, then `host.block_hash` (L2 header DB). ArbOS
+`arb_block_hash` reads the L1 ring (`>= current || current > number+256` →
+zero, unmetered). Bridging NUMBER must not be treated as bridging BLOCKHASH.
+
+Other env opcodes (COINBASE, DIFFICULTY, GASPRICE, …) share `Host` with the
+interpreter and are not overridden.
 
 revmc `79e3c8ca` ends a gas section at `GAS`, Istanbul+ `SSTORE`, branches, and
 CALL/CREATE (after charging that opcode's own base gas). Trailing static costs
@@ -96,10 +117,11 @@ That requires:
 
 1. Warm compile of the eligible contracts **outside** replay.
 2. A replay that still runs `ArbHandler` (poster fees, retryables, precompiles,
-   Stylus, NUMBER/BLOCKHASH on non-compiled frames).
+   Stylus, BLOCKHASH and other non-compiled frames).
 3. Coverage high enough that interpreter fallback + handler/precompile/Stylus
-   time do not dominate. Frames with `NUMBER`/`BLOCKHASH`, initcode, Stylus, and
-   unknown hashes still interpret.
+   time do not dominate. Frames with `BLOCKHASH`, initcode, Stylus, and
+   unknown hashes still interpret. `NUMBER`-only images may compile when the
+   adapter is in use. This checkout does not measure that coverage shift.
 4. Compare full message/block replay time, not `call_with_interpreter` alone.
 
 This checkout does not run that replay. Parent owns the probe.
@@ -115,8 +137,16 @@ so the module outlives dispatch.
 
 - Inspect/trace path always interprets (`inspect_frame_run` does not use
   compiled dispatch). Compiled-path bugs will not show up in `debug_trace`.
-- revmc `NUMBER`/`BLOCKHASH` builtins are L2; we refuse those opcodes rather
-  than teaching revmc ArbOS L1 semantics.
+- revmc `BLOCKHASH` stays refused (extra range check + L2 `Host::block_hash`
+  vs ArbOS L1 ring). `NUMBER` is bridged only through the compiled Host
+  adapter; the interpreter table override is unchanged.
+- Compiled dispatch always installs the NUMBER adapter, including on frames
+  that never execute NUMBER. `call_with_interpreter` already takes
+  `&mut dyn Host`; the adapter adds a forwarding layer and a `u64` copy of
+  `l1_block_number` at frame entry. The generic inner Host may be inlined;
+  an extra vtable hop is not established. Any remaining forwarding overhead
+  is on the warm path and must be measured, not assumed away.
+  Parent owns whole-replay timing of `5c00135` vs this change.
 - `Host` is required on `EvmTr`/`ExecuteEvm` **only** with `--features compiled-frame`
   (`CompiledFrameCtx`). Default-off bounds are unchanged.
 - Enabling `compiled-frame` in a workspace adds a private registry field to
@@ -137,5 +167,8 @@ so the module outlives dispatch.
 - Parity tests cover arithmetic, exact halt reasons, REVERT leftover gas,
   SSTORE, SSTORE sentry, GAS-then-static-ops, nested CALL (per-hash hits),
   CALL stipend = GAS, reverted-child resume, initcode skip, miss, spec
-  mismatch, PUSH-immediate exclusion, and the 256-opcode instruction-table
-  diff. They are not a replay corpus. No whole-block speed claim.
+  mismatch, PUSH-immediate exclusion, the 256-opcode instruction-table
+  diff, compiled NUMBER vs L1 (not L2) with matching gas/state, nested
+  compiled NUMBER, NUMBER after compiled resume, original `BlockEnv`
+  unchanged, and BLOCKHASH still refused. They are not a replay corpus.
+  No whole-block speed claim.

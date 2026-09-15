@@ -68,11 +68,24 @@ where
 
 /// Opcodes whose instruction-table entries `ArbEvm::new` replaces.
 ///
-/// Compiled frames skip the instruction table, so these must be refused by
-/// [`crate::compiled_frame::bytecode_ineligible`]. Kept next to the
-/// `insert_instruction` calls. Sorted numerically. The table-diff test in this
-/// file fails if `ArbEvm::new` grows another override without updating this list.
+/// Compiled frames skip the instruction table. Each opcode here must be either
+/// refused by [`crate::compiled_frame::bytecode_ineligible`] or listed in
+/// [`COMPILED_HOST_BRIDGED_OVERRIDES`] and parity-tested on the compiled Host
+/// adapter. Kept next to the `insert_instruction` calls. Sorted numerically.
+/// The table-diff test in this file fails if `ArbEvm::new` grows another
+/// override without updating this list.
 pub const ARB_INSTRUCTION_OVERRIDES: &[u8] = &[opcode::BLOCKHASH, opcode::NUMBER];
+
+/// Subset of [`ARB_INSTRUCTION_OVERRIDES`] that compiled frames may execute.
+///
+/// NUMBER is bridged: revmc `__revmc_builtin_number` calls `Host::block_number()`,
+/// and the compiled-only adapter returns `chain().l1_block_number` without
+/// writing `BlockEnv`. BLOCKHASH is **not** listed. Its builtin subtracts the
+/// requested number from `Host::block_number()` and, for a 256-block L2 window,
+/// calls `Host::block_hash` (header DB). That is not the ArbOS L1 ring used by
+/// `arb_block_hash`. Do not add an opcode here without a compiled-vs-interpreter
+/// parity test; unclassified overrides stay refused.
+pub const COMPILED_HOST_BRIDGED_OVERRIDES: &[u8] = &[opcode::NUMBER];
 
 /// Arbitrum EVM wrapper over revm's generic [`Evm`] type.
 ///
@@ -115,6 +128,12 @@ where
         debug_assert_eq!(
             ARB_INSTRUCTION_OVERRIDES,
             &[opcode::BLOCKHASH, opcode::NUMBER]
+        );
+        debug_assert_eq!(COMPILED_HOST_BRIDGED_OVERRIDES, &[opcode::NUMBER]);
+        debug_assert!(
+            COMPILED_HOST_BRIDGED_OVERRIDES
+                .iter()
+                .all(|op| ARB_INSTRUCTION_OVERRIDES.contains(op))
         );
         Self::from_inner(Evm {
             ctx,
@@ -240,7 +259,13 @@ where
         if !registry.accepts_context(spec, self.0.ctx.cfg().gas_params()) {
             return None;
         }
-        crate::compiled_frame::try_execute(registry, self.0.frame_stack.get(), &mut self.0.ctx)
+        let l1_block_number = self.0.ctx.chain().l1_block_number;
+        crate::compiled_frame::try_execute(
+            registry,
+            self.0.frame_stack.get(),
+            &mut self.0.ctx,
+            l1_block_number,
+        )
     }
 }
 
@@ -392,7 +417,7 @@ fn span_address(input: &FrameInput) -> Option<Address> {
 
 #[cfg(test)]
 mod instruction_table_diff {
-    use super::ARB_INSTRUCTION_OVERRIDES;
+    use super::{ARB_INSTRUCTION_OVERRIDES, COMPILED_HOST_BRIDGED_OVERRIDES};
     use crate::{ArbBuilder, ArbContext, ArbSpecId, DefaultArb};
     use revm::{
         context::CfgEnv,
@@ -437,6 +462,17 @@ mod instruction_table_diff {
             diffs.as_slice(),
             ARB_INSTRUCTION_OVERRIDES,
             "every instruction-table/gas-table difference must be in ARB_INSTRUCTION_OVERRIDES"
+        );
+        assert!(
+            COMPILED_HOST_BRIDGED_OVERRIDES
+                .iter()
+                .all(|op| ARB_INSTRUCTION_OVERRIDES.contains(op)),
+            "bridged opcodes must be actual instruction-table overrides"
+        );
+        assert_eq!(
+            COMPILED_HOST_BRIDGED_OVERRIDES,
+            &[revm::bytecode::opcode::NUMBER],
+            "new table overrides must be refused or given an explicit compiled-host parity test; do not expand this allowlist silently"
         );
     }
 }

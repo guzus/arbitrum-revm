@@ -10,13 +10,14 @@
 use arb_revm::transaction::arb_envelope_to_tx_env;
 use arb_revm::{
     ARB_INSTRUCTION_OVERRIDES, ArbBuilder, ArbChainContext, ArbContext, ArbSpecId, ArbTransaction,
-    CompiledFrameRegistry, DefaultArb, bytecode_ineligible,
+    COMPILED_HOST_BRIDGED_OVERRIDES, CompiledFrameRegistry, DefaultArb, bytecode_ineligible,
 };
 use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
 use revm::{
     ExecuteEvm,
     context::{BlockEnv, CfgEnv, TxEnv, result::ExecutionResult},
     database::{CacheDB, EmptyDB},
+    interpreter::Host,
     primitives::{Address, Bytes, TxKind, U256, keccak256},
     state::{AccountInfo, Bytecode, EvmState},
 };
@@ -123,6 +124,20 @@ fn word32(last: u8) -> Bytes {
     let mut word = vec![0_u8; 32];
     word[31] = last;
     Bytes::from(word)
+}
+
+fn word_u256(value: u64) -> Bytes {
+    Bytes::from(U256::from(value).to_be_bytes::<32>().to_vec())
+}
+
+/// NUMBER PUSH1 0 SSTORE STOP
+fn number_sstore_code() -> Bytes {
+    Bytes::from(vec![0x43, 0x60, 0x00, 0x55, 0x00])
+}
+
+/// NUMBER PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+fn number_return_code() -> Bytes {
+    Bytes::from(vec![0x43, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3])
 }
 
 fn slot0(state: &EvmState, address: Address) -> U256 {
@@ -390,11 +405,11 @@ fn spec_mismatch_does_not_dispatch() {
 #[test]
 fn excluded_opcodes_rejected_at_compile() {
     let mut registry = CompiledFrameRegistry::new(ArbSpecId::NITRO).expect("llvm");
-    let number = vec![0x43, 0x60, 0x00, 0x55, 0x00];
+    let number = number_sstore_code();
     let blockhash = vec![0x60, 0x01, 0x40, 0x00];
-    assert!(bytecode_ineligible(&number).is_some());
+    assert!(bytecode_ineligible(number.as_ref()).is_none());
     assert!(bytecode_ineligible(&blockhash).is_some());
-    assert!(registry.compile(&number).is_err());
+    assert!(registry.compile(number.as_ref()).is_ok());
     assert!(registry.compile(&blockhash).is_err());
 }
 
@@ -427,10 +442,13 @@ fn denylist_covers_arb_instruction_overrides() {
         &[0x40, 0x43],
         "must stay aligned with evm.rs insert_instruction + table-diff test"
     );
+    assert_eq!(COMPILED_HOST_BRIDGED_OVERRIDES, &[0x43]);
     for &op in ARB_INSTRUCTION_OVERRIDES {
-        assert!(
-            bytecode_ineligible(&[op, 0x00]).is_some(),
-            "override opcode 0x{op:02x} must be ineligible"
+        let bridged = COMPILED_HOST_BRIDGED_OVERRIDES.contains(&op);
+        let ineligible = bytecode_ineligible(&[op, 0x00]).is_some();
+        assert_ne!(
+            bridged, ineligible,
+            "override 0x{op:02x} must be host-bridged or refused, not both/neither"
         );
     }
 }
@@ -589,4 +607,144 @@ fn compiled_caller_resumes_after_reverted_child() {
     assert_same_outcome(&interpreted, &compiled);
     assert!(registry.dispatch_hits_for(keccak256(&caller_code)) >= 2);
     assert!(registry.dispatch_hits_for(keccak256(&callee_code)) >= 1);
+}
+
+#[test]
+fn compiled_number_returns_l1_not_l2_and_matches_interpreter() {
+    let code = number_sstore_code();
+    let registry = warm_compile(ArbSpecId::NITRO, &[code.as_ref()]);
+
+    let mut db_i = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_i, CONTRACT, code.clone());
+    let interpreted = transact(&mut db_i, unsigned_call(CONTRACT, 100_000), None);
+
+    let mut db_c = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_c, CONTRACT, code);
+    let compiled = transact(
+        &mut db_c,
+        unsigned_call(CONTRACT, 100_000),
+        Some(registry.clone()),
+    );
+
+    assert!(interpreted.result.is_success(), "{:?}", interpreted.result);
+    assert_same_outcome(&interpreted.result, &compiled.result);
+    assert_eq!(slot0(&interpreted.state, CONTRACT), U256::from(777_u64));
+    assert_eq!(slot0(&compiled.state, CONTRACT), U256::from(777_u64));
+    assert_ne!(slot0(&compiled.state, CONTRACT), U256::from(1000_u64));
+    assert_eq!(interpreted.state, compiled.state);
+    assert!(registry.dispatch_hits() >= 1);
+}
+
+#[test]
+fn compiled_nested_number_matches_interpreter() {
+    let callee_code = number_sstore_code();
+    let mut caller_code = vec![0x43, 0x60, 0x00, 0x55]; // NUMBER PUSH1 0 SSTORE
+    caller_code.extend_from_slice(&[
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+    ]);
+    caller_code.extend_from_slice(CALLEE.as_slice());
+    caller_code.extend_from_slice(&[0x5a, 0xf1, 0x50, 0x00]); // GAS CALL POP STOP
+    let caller_code = Bytes::from(caller_code);
+    let registry = warm_compile(
+        ArbSpecId::NITRO,
+        &[callee_code.as_ref(), caller_code.as_ref()],
+    );
+
+    let mut db_i = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_i, CALLEE, callee_code.clone());
+    insert_code(&mut db_i, CONTRACT, caller_code.clone());
+    let interpreted = transact(&mut db_i, unsigned_call(CONTRACT, 200_000), None);
+
+    let mut db_c = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_c, CALLEE, callee_code.clone());
+    insert_code(&mut db_c, CONTRACT, caller_code.clone());
+    let compiled = transact(
+        &mut db_c,
+        unsigned_call(CONTRACT, 200_000),
+        Some(registry.clone()),
+    );
+
+    assert!(interpreted.result.is_success(), "{:?}", interpreted.result);
+    assert_same_outcome(&interpreted.result, &compiled.result);
+    assert_eq!(slot0(&interpreted.state, CONTRACT), U256::from(777_u64));
+    assert_eq!(slot0(&interpreted.state, CALLEE), U256::from(777_u64));
+    assert_eq!(slot0(&compiled.state, CONTRACT), U256::from(777_u64));
+    assert_eq!(slot0(&compiled.state, CALLEE), U256::from(777_u64));
+    assert_eq!(interpreted.state, compiled.state);
+    assert!(registry.dispatch_hits_for(keccak256(&caller_code)) >= 1);
+    assert!(registry.dispatch_hits_for(keccak256(&callee_code)) >= 1);
+}
+
+#[test]
+fn compiled_number_leaves_block_env_unchanged() {
+    let code = number_return_code();
+    let registry = warm_compile(ArbSpecId::NITRO, &[code.as_ref()]);
+    let mut db = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db, CONTRACT, code);
+
+    let chain = ArbChainContext::new(None).with_l1_block_number(777);
+    let mut block = BlockEnv::default();
+    block.number = U256::from(1000);
+    let ctx: ArbContext<&mut _> = ArbContext::arb_with_chain_context(chain)
+        .with_db(&mut db)
+        .with_cfg(cfg())
+        .with_block(block)
+        .with_tx(ArbTransaction::<TxEnv>::default());
+    let mut evm = ctx.build_arb();
+    evm.set_compiled_programs(Some(registry.clone()));
+    let out = evm
+        .transact(unsigned_call(CONTRACT, 100_000))
+        .expect("execution");
+
+    assert!(out.result.is_success(), "{:?}", out.result);
+    assert_eq!(out.result.output(), Some(&word_u256(777)));
+    assert_eq!(evm.0.ctx.block.number, U256::from(1000_u64));
+    assert_eq!(Host::block_number(&evm.0.ctx), U256::from(1000_u64));
+    assert_eq!(evm.0.ctx.chain.l1_block_number, 777);
+    assert!(registry.dispatch_hits() >= 1);
+}
+
+#[test]
+fn compiled_caller_number_after_reverted_child() {
+    let callee_code = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]);
+    let mut caller_code = vec![
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+    ];
+    caller_code.extend_from_slice(CALLEE.as_slice());
+    caller_code.extend_from_slice(&[
+        0x61, 0x40, 0x00, 0xf1, // CALL
+        0x50, // POP
+        0x43, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, // NUMBER, RETURN it
+    ]);
+    let caller_code = Bytes::from(caller_code);
+    let registry = warm_compile(
+        ArbSpecId::NITRO,
+        &[callee_code.as_ref(), caller_code.as_ref()],
+    );
+
+    let mut db_i = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_i, CALLEE, callee_code.clone());
+    insert_code(&mut db_i, CONTRACT, caller_code.clone());
+    let interpreted = transact_call(&mut db_i, CONTRACT, 200_000, None);
+
+    let mut db_c = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_c, CALLEE, callee_code.clone());
+    insert_code(&mut db_c, CONTRACT, caller_code.clone());
+    let compiled = transact_call(&mut db_c, CONTRACT, 200_000, Some(registry.clone()));
+
+    assert!(interpreted.is_success(), "{interpreted:?}");
+    assert_eq!(interpreted.output(), Some(&word_u256(777)));
+    assert_same_outcome(&interpreted, &compiled);
+    assert!(registry.dispatch_hits_for(keccak256(&caller_code)) >= 2);
+}
+
+#[test]
+fn blockhash_still_rejected_at_compile() {
+    let mut registry = CompiledFrameRegistry::new(ArbSpecId::NITRO).expect("llvm");
+    let blockhash_only = vec![0x60, 0x01, 0x40, 0x00];
+    let number_then_blockhash = vec![0x43, 0x60, 0x01, 0x40, 0x00];
+    assert!(bytecode_ineligible(&blockhash_only).is_some());
+    assert!(bytecode_ineligible(&number_then_blockhash).is_some());
+    assert!(registry.compile(&blockhash_only).is_err());
+    assert!(registry.compile(&number_then_blockhash).is_err());
 }

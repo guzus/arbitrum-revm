@@ -1,6 +1,6 @@
 //! Conservative compile eligibility. Decoding skips PUSH (and other) immediates.
 
-use crate::evm::ARB_INSTRUCTION_OVERRIDES;
+use crate::evm::{ARB_INSTRUCTION_OVERRIDES, COMPILED_HOST_BRIDGED_OVERRIDES};
 use revm::bytecode::opcode::OPCODE_INFO;
 
 /// Why a bytecode image is refused for compilation.
@@ -11,16 +11,23 @@ pub enum IneligibleReason {
     /// `0xEF` prefix: EOF or a Stylus discriminant. Stylus is handled before this
     /// path; EOF is out of scope for the prototype.
     EofOrStylusPrefix,
-    /// Opcode whose ArbEvm instruction-table entry differs from mainnet.
-    /// Compiled code skips that table; revmc builtins for NUMBER/BLOCKHASH use
-    /// `Host::{block_number,block_hash}` (L2), not the L1 instruction overrides.
+    /// Opcode whose ArbEvm instruction-table entry differs from mainnet and is
+    /// **not** listed in [`COMPILED_HOST_BRIDGED_OVERRIDES`].
+    ///
+    /// Compiled code skips the instruction table. Unclassified overrides are
+    /// refused. NUMBER is bridged (compiled Host `block_number` returns L1).
+    /// BLOCKHASH stays refused: revmc's builtin adds an L2-style 256-block range
+    /// check against `Host::block_number()` then `Host::block_hash()`, which is
+    /// not the ArbOS L1 ring used by the interpreter override.
     InstructionOverride(u8),
 }
 
 /// Returns `Some` when `code` must not be compiled.
 ///
 /// Immediate bytes of `PUSH1..=PUSH32` (and any other opcode with an immediate) are
-/// skipped so a `PUSH1 0x43` does **not** count as `NUMBER`.
+/// skipped so a `PUSH1 0x43` does **not** count as `NUMBER`. Table overrides are
+/// refused unless they are explicitly host-bridged; adding an `insert_instruction`
+/// without classifying it fails closed (ineligible), not open.
 pub fn bytecode_ineligible(code: &[u8]) -> Option<IneligibleReason> {
     if code.is_empty() {
         return Some(IneligibleReason::Empty);
@@ -32,7 +39,8 @@ pub fn bytecode_ineligible(code: &[u8]) -> Option<IneligibleReason> {
     let mut i = 0;
     while i < code.len() {
         let op = code[i];
-        if ARB_INSTRUCTION_OVERRIDES.contains(&op) {
+        if ARB_INSTRUCTION_OVERRIDES.contains(&op) && !COMPILED_HOST_BRIDGED_OVERRIDES.contains(&op)
+        {
             return Some(IneligibleReason::InstructionOverride(op));
         }
         let immediate = OPCODE_INFO[op as usize]
@@ -58,15 +66,41 @@ mod tests {
     }
 
     #[test]
-    fn number_and_blockhash_opcodes_are_ineligible() {
+    fn number_is_eligible_blockhash_is_not() {
         assert_eq!(
             bytecode_ineligible(&[opcode::NUMBER, opcode::STOP]),
-            Some(IneligibleReason::InstructionOverride(opcode::NUMBER))
+            None,
+            "NUMBER is host-bridged and must compile"
         );
         assert_eq!(
             bytecode_ineligible(&[opcode::BLOCKHASH, opcode::STOP]),
             Some(IneligibleReason::InstructionOverride(opcode::BLOCKHASH))
         );
+        assert_eq!(
+            bytecode_ineligible(&[opcode::NUMBER, opcode::BLOCKHASH, opcode::STOP]),
+            Some(IneligibleReason::InstructionOverride(opcode::BLOCKHASH)),
+            "NUMBER must not waive a co-occurring refused override"
+        );
+    }
+
+    #[test]
+    fn every_instruction_override_is_bridged_or_refused() {
+        use crate::evm::{ARB_INSTRUCTION_OVERRIDES, COMPILED_HOST_BRIDGED_OVERRIDES};
+        for &op in ARB_INSTRUCTION_OVERRIDES {
+            let bridged = COMPILED_HOST_BRIDGED_OVERRIDES.contains(&op);
+            let refused = bytecode_ineligible(&[op, opcode::STOP])
+                == Some(IneligibleReason::InstructionOverride(op));
+            assert_ne!(
+                bridged, refused,
+                "opcode 0x{op:02x} must be exactly one of host-bridged or refused"
+            );
+        }
+        for &op in COMPILED_HOST_BRIDGED_OVERRIDES {
+            assert!(
+                ARB_INSTRUCTION_OVERRIDES.contains(&op),
+                "bridged opcode 0x{op:02x} is not an instruction-table override"
+            );
+        }
     }
 
     #[test]
@@ -99,10 +133,18 @@ mod tests {
     }
 
     #[test]
-    fn number_after_push_is_still_detected() {
+    fn number_after_push_is_eligible() {
         assert_eq!(
             bytecode_ineligible(&[opcode::PUSH1, 0x01, opcode::NUMBER, opcode::STOP]),
-            Some(IneligibleReason::InstructionOverride(opcode::NUMBER))
+            None
+        );
+    }
+
+    #[test]
+    fn blockhash_after_push_is_still_detected() {
+        assert_eq!(
+            bytecode_ineligible(&[opcode::PUSH1, 0x01, opcode::BLOCKHASH, opcode::STOP]),
+            Some(IneligibleReason::InstructionOverride(opcode::BLOCKHASH))
         );
     }
 }

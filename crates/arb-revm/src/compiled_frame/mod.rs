@@ -12,6 +12,7 @@
 
 mod dispatch;
 mod eligibility;
+mod host;
 mod registry;
 
 pub use eligibility::{IneligibleReason, bytecode_ineligible};
