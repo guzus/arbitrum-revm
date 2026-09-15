@@ -1,3 +1,4 @@
+use crate::l1_cost::PreparedPosterCompression;
 use alloy_consensus::transaction::Transaction as AlloyTransaction;
 use alloy_eips::eip2718::{Encodable2718, Typed2718};
 use arbitrum_alloy_consensus::transactions::ArbTxEnvelope;
@@ -11,6 +12,7 @@ use revm::{
     handler::SystemCallTx,
     primitives::{Address, B256, Bytes, TxKind, U256},
 };
+use std::sync::Arc;
 
 /// Retry-transaction metadata that is not representable in revm's base `TxEnv`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +102,7 @@ impl TryFrom<&ArbTxEnvelope> for ArbTransaction<TxEnv> {
             retry_meta,
             tx_hash: Some(tx.hash()),
             encoded_2718: Some(Bytes::from(tx.encoded_2718())),
+            prepared_poster_compression: None,
         })
     }
 }
@@ -124,6 +127,11 @@ pub trait ArbTxTr: Transaction {
         None
     }
 
+    /// Optional execution-only compression hint; never a source of transaction semantics.
+    fn prepared_poster_compression(&self) -> Option<&Arc<PreparedPosterCompression>> {
+        None
+    }
+
     /// Returns canonical EIP-2718 transaction bytes when available.
     fn encoded_2718_bytes(&self) -> Option<&[u8]> {
         None
@@ -131,7 +139,7 @@ pub trait ArbTxTr: Transaction {
 }
 
 /// Arbitrum transaction wrapper around a base transaction type.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ArbTransaction<T: Transaction> {
     /// Base transaction fields.
     pub base: T,
@@ -141,7 +149,21 @@ pub struct ArbTransaction<T: Transaction> {
     pub tx_hash: Option<B256>,
     /// Canonical EIP-2718 envelope bytes for this tx, if known.
     pub encoded_2718: Option<Bytes>,
+    /// Immutable optimization hint, validated against exact bytes and current settings.
+    /// Excluded from semantic equality. Fresh conversions and system calls leave it empty.
+    pub prepared_poster_compression: Option<Arc<PreparedPosterCompression>>,
 }
+
+impl<T: Transaction + PartialEq> PartialEq for ArbTransaction<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.base == other.base
+            && self.retry_meta == other.retry_meta
+            && self.tx_hash == other.tx_hash
+            && self.encoded_2718 == other.encoded_2718
+    }
+}
+
+impl<T: Transaction + Eq> Eq for ArbTransaction<T> {}
 
 impl<T: Transaction> ArbTransaction<T> {
     /// Creates a new wrapped transaction.
@@ -151,6 +173,7 @@ impl<T: Transaction> ArbTransaction<T> {
             retry_meta: None,
             tx_hash: None,
             encoded_2718: None,
+            prepared_poster_compression: None,
         }
     }
 
@@ -193,6 +216,7 @@ impl Default for ArbTransaction<TxEnv> {
             retry_meta: None,
             tx_hash: None,
             encoded_2718: None,
+            prepared_poster_compression: None,
         }
     }
 }
@@ -208,11 +232,16 @@ impl<TX: Transaction + SystemCallTx> SystemCallTx for ArbTransaction<TX> {
             retry_meta: None,
             tx_hash: None,
             encoded_2718: None,
+            prepared_poster_compression: None,
         }
     }
 }
 
 impl<T: Transaction> ArbTxTr for ArbTransaction<T> {
+    fn prepared_poster_compression(&self) -> Option<&Arc<PreparedPosterCompression>> {
+        self.prepared_poster_compression.as_ref()
+    }
+
     fn retry_meta(&self) -> Option<&RetryTxMeta> {
         self.retry_meta.as_ref()
     }
@@ -340,6 +369,7 @@ impl ArbTransactionBuilder {
             retry_meta: None,
             tx_hash: None,
             encoded_2718: None,
+            prepared_poster_compression: None,
         }
     }
 
@@ -350,6 +380,151 @@ impl ArbTransactionBuilder {
             retry_meta: None,
             tx_hash: None,
             encoded_2718: None,
+            prepared_poster_compression: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod prepared_hint_tests {
+    use super::*;
+
+    fn hint() -> Arc<PreparedPosterCompression> {
+        Arc::new(
+            PreparedPosterCompression::prepare(
+                b"canonical transaction bytes",
+                0,
+                brotli::DEFAULT_WINDOW_SIZE,
+                brotli::Dictionary::Empty,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn prepared_hint_is_not_transaction_identity() {
+        let plain = ArbTransaction::default();
+        let mut prepared = plain.clone();
+        let item = hint();
+        prepared.prepared_poster_compression = Some(item.clone());
+        assert_eq!(plain, prepared);
+        assert!(Arc::ptr_eq(
+            prepared.clone().prepared_poster_compression().unwrap(),
+            &item
+        ));
+        prepared.base.nonce += 1;
+        assert_ne!(plain, prepared);
+    }
+
+    #[test]
+    fn fresh_transactions_and_system_calls_do_not_inherit_hints() {
+        assert!(
+            ArbTransaction::new(TxEnv::default())
+                .prepared_poster_compression()
+                .is_none()
+        );
+        assert!(
+            ArbTransaction::default()
+                .prepared_poster_compression()
+                .is_none()
+        );
+        assert!(
+            ArbTransaction::builder()
+                .build_fill()
+                .prepared_poster_compression()
+                .is_none()
+        );
+        let system = ArbTransaction::<TxEnv>::new_system_tx_with_caller(
+            Address::ZERO,
+            Address::ZERO,
+            Bytes::new(),
+        );
+        assert!(system.prepared_poster_compression().is_none());
+    }
+
+    #[test]
+    fn handler_consumes_hint_with_identical_execution_result() {
+        use crate::{ArbBuilder, ArbChainContext, ArbSpecId, encode_tx_bytes};
+        use revm::context::{BlockEnv, CfgEnv};
+        use revm::{Context, ExecuteEvm, MainContext};
+        let tx = ArbTransaction::default();
+        let item = Arc::new(
+            PreparedPosterCompression::prepare(
+                &encode_tx_bytes(&tx),
+                0,
+                brotli::DEFAULT_WINDOW_SIZE,
+                brotli::Dictionary::Empty,
+            )
+            .unwrap(),
+        );
+        let run = |tx| {
+            let mut evm = Context::mainnet()
+                .with_tx(ArbTransaction::default())
+                .with_cfg(CfgEnv::new_with_spec(ArbSpecId::NITRO))
+                .with_block(BlockEnv {
+                    beneficiary: crate::constants::BATCH_POSTER_ADDRESS,
+                    basefee: 0,
+                    ..Default::default()
+                })
+                .with_chain(ArbChainContext::default())
+                .build_arb();
+            evm.transact(tx).unwrap()
+        };
+        let baseline = run(tx.clone());
+        let mut prepared = tx;
+        prepared.prepared_poster_compression = Some(item.clone());
+        assert_eq!(baseline, run(prepared));
+        assert_eq!(item.hit_count(), 1);
+    }
+
+    #[test]
+    fn transaction_replacement_and_system_call_clear_prior_hint() {
+        use crate::{ArbBuilder, ArbChainContext, ArbSpecId};
+        use revm::context::CfgEnv;
+        use revm::context_interface::ContextTr;
+        use revm::handler::{EvmTr, system_call::SystemCallEvm};
+        use revm::{Context, ExecuteEvm, MainContext};
+        let mut evm = Context::mainnet()
+            .with_tx(ArbTransaction::default())
+            .with_cfg(CfgEnv::new_with_spec(ArbSpecId::NITRO))
+            .with_chain(ArbChainContext::default())
+            .build_arb();
+        let mut hinted = ArbTransaction::default();
+        hinted.prepared_poster_compression = Some(hint());
+        // Invalid transactions exercise replacement even when validation fails.
+        hinted.base.gas_limit = 0;
+        assert!(evm.transact_one(hinted.clone()).is_err());
+        assert!(evm.ctx().tx().prepared_poster_compression().is_some());
+        let mut next = ArbTransaction::default();
+        next.base.gas_limit = 0;
+        assert!(evm.transact_one(next).is_err());
+        assert!(evm.ctx().tx().prepared_poster_compression().is_none());
+        assert!(evm.transact_one(hinted).is_err());
+        let _ = evm.system_call_one_with_caller(Address::ZERO, Address::ZERO, Bytes::new());
+        assert!(evm.ctx().tx().prepared_poster_compression().is_none());
+    }
+
+    #[test]
+    fn counts_only_actual_exact_consumptions() {
+        use crate::constants::BATCH_POSTER_ADDRESS;
+        use crate::l1_cost::compute_poster_info_with_prepared;
+        let item = hint();
+        let run = |bytes: &[u8], level, coinbase| {
+            compute_poster_info_with_prepared(
+                bytes,
+                coinbase,
+                U256::ZERO,
+                U256::ZERO,
+                level,
+                Some(&item),
+            );
+        };
+        run(b"wrong bytes", 0, BATCH_POSTER_ADDRESS);
+        run(b"canonical transaction bytes", 1, BATCH_POSTER_ADDRESS);
+        run(b"canonical transaction bytes", 0, Address::ZERO);
+        run(b"", 0, BATCH_POSTER_ADDRESS);
+        assert_eq!(item.hit_count(), 0);
+        run(b"canonical transaction bytes", 0, BATCH_POSTER_ADDRESS);
+        assert_eq!(item.hit_count(), 1);
     }
 }
