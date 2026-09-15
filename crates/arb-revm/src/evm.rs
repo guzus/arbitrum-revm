@@ -90,6 +90,7 @@ pub struct ArbEvm<
     pub Evm<CTX, INSP, I, P, F>,
     #[cfg(feature = "compiled-frame")]
     Option<std::sync::Arc<crate::compiled_frame::CompiledFrameRegistry>>,
+    #[cfg(feature = "direct-stack-dispatch")] Option<crate::stack_dispatch::FrameRunner<CTX, I>>,
 );
 
 impl<CTX, INSP> ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, ArbPrecompiles>
@@ -99,23 +100,7 @@ where
     /// Creates a new Arbitrum EVM.
     pub fn new(ctx: CTX, inspector: INSP) -> Self {
         let spec: ArbSpecId = ctx.cfg().spec().into();
-        let mut instruction = EthInstructions::new_mainnet_with_spec(spec.into());
-        // Arbitrum overrides NUMBER (returns the L1 block number) and BLOCKHASH (returns the
-        // ArbOS-stored L1 block hash).
-        instruction.insert_instruction(
-            opcode::NUMBER,
-            Instruction::new(arb_block_number::<CTX>),
-            2,
-        );
-        instruction.insert_instruction(
-            opcode::BLOCKHASH,
-            Instruction::new(arb_block_hash::<CTX>),
-            20,
-        );
-        debug_assert_eq!(
-            ARB_INSTRUCTION_OVERRIDES,
-            &[opcode::BLOCKHASH, opcode::NUMBER]
-        );
+        let instruction = canonical_arb_instructions(spec);
         Self::from_inner(Evm {
             ctx,
             inspector,
@@ -131,6 +116,34 @@ where
     }
 }
 
+#[cfg(feature = "direct-stack-dispatch")]
+impl<CTX, INSP>
+    ArbEvm<CTX, INSP, crate::stack_dispatch::CanonicalStackInstructions<CTX>, ArbPrecompiles>
+where
+    CTX: ContextTr<Cfg: Cfg<Spec: Into<ArbSpecId> + Clone>, Chain = ArbChainContext> + Host,
+{
+    /// Explicit experiment constructor. Its immutable provider is built canonically here.
+    pub fn new_canonical(
+        ctx: CTX,
+        inspector: INSP,
+        mode: crate::stack_dispatch::StackDispatchMode,
+    ) -> Self {
+        let spec: ArbSpecId = ctx.cfg().spec().into();
+        Self(
+            Evm {
+                ctx,
+                inspector,
+                instruction: crate::stack_dispatch::CanonicalStackInstructions::new(spec, mode),
+                precompiles: ArbPrecompiles::new_with_spec(spec),
+                frame_stack: FrameStack::new_prealloc(8),
+            },
+            #[cfg(feature = "compiled-frame")]
+            None,
+            Some(crate::stack_dispatch::run_frame::<CTX>),
+        )
+    }
+}
+
 impl<CTX, INSP, I, P> ArbEvm<CTX, INSP, I, P> {
     /// Wraps an inner revm [`Evm`]. With `compiled-frame` the registry starts empty
     /// (interpreter path). Prefer this over `ArbEvm(inner)` from other crates: enabling
@@ -143,24 +156,46 @@ impl<CTX, INSP, I, P> ArbEvm<CTX, INSP, I, P> {
             inner,
             #[cfg(feature = "compiled-frame")]
             None,
+            #[cfg(feature = "direct-stack-dispatch")]
+            None,
         )
+    }
+
+    #[cfg(feature = "direct-stack-dispatch")]
+    fn stack_runner(&self) -> Option<crate::stack_dispatch::FrameRunner<CTX, I>> {
+        #[cfg(feature = "compiled-frame")]
+        {
+            self.2
+        }
+        #[cfg(not(feature = "compiled-frame"))]
+        {
+            self.1
+        }
     }
 
     /// Consumes self and returns a new EVM with a different inspector.
     pub fn with_inspector<OINSP>(self, inspector: OINSP) -> ArbEvm<CTX, OINSP, I, P> {
+        #[cfg(feature = "direct-stack-dispatch")]
+        let runner = self.stack_runner();
         ArbEvm(
             self.0.with_inspector(inspector),
             #[cfg(feature = "compiled-frame")]
             self.1,
+            #[cfg(feature = "direct-stack-dispatch")]
+            runner,
         )
     }
 
     /// Consumes self and returns a new EVM with a different precompile provider.
     pub fn with_precompiles<OP>(self, precompiles: OP) -> ArbEvm<CTX, INSP, I, OP> {
+        #[cfg(feature = "direct-stack-dispatch")]
+        let runner = self.stack_runner();
         ArbEvm(
             self.0.with_precompiles(precompiles),
             #[cfg(feature = "compiled-frame")]
             self.1,
+            #[cfg(feature = "direct-stack-dispatch")]
+            runner,
         )
     }
 
@@ -340,6 +375,26 @@ where
                 }
             });
         }
+        #[cfg(feature = "direct-stack-dispatch")]
+        {
+            let runner = self.stack_runner();
+            let inner = &mut self.0;
+            if let Some(run) = runner {
+                let frame = inner.frame_stack.get();
+                let action = run(
+                    &mut frame.interpreter,
+                    &mut inner.instruction,
+                    &mut inner.ctx,
+                );
+                return frame
+                    .process_next_action(&mut inner.ctx, action)
+                    .inspect(|next| {
+                        if next.is_result() {
+                            frame.set_finished(true);
+                        }
+                    });
+            }
+        }
         self.0.frame_run()
     }
 
@@ -373,6 +428,28 @@ where
         }
         self.0.frame_return_result(result)
     }
+}
+
+pub(crate) fn canonical_arb_instructions<CTX>(
+    spec: ArbSpecId,
+) -> EthInstructions<EthInterpreter, CTX>
+where
+    CTX: ContextTr<Chain = ArbChainContext> + Host,
+{
+    let mut instruction = EthInstructions::new_mainnet_with_spec(spec.into());
+    // Arbitrum overrides NUMBER (returns the L1 block number) and BLOCKHASH (returns the
+    // ArbOS-stored L1 block hash).
+    instruction.insert_instruction(opcode::NUMBER, Instruction::new(arb_block_number::<CTX>), 2);
+    instruction.insert_instruction(
+        opcode::BLOCKHASH,
+        Instruction::new(arb_block_hash::<CTX>),
+        20,
+    );
+    debug_assert_eq!(
+        ARB_INSTRUCTION_OVERRIDES,
+        &[opcode::BLOCKHASH, opcode::NUMBER]
+    );
+    instruction
 }
 
 /// The acting address whose context span a new frame opens, per Nitro's `PushContract`:

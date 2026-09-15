@@ -30,6 +30,8 @@ pub mod precompiles;
 pub mod replay;
 mod retry_tx;
 pub mod spec;
+#[cfg(feature = "direct-stack-dispatch")]
+pub mod stack_dispatch;
 pub mod state_trie;
 pub mod storage;
 #[cfg(feature = "stylus")]
@@ -62,6 +64,10 @@ pub use l1_cost::{
 pub use precompiles::ArbPrecompiles;
 pub use revm;
 pub use spec::ArbSpecId;
+#[cfg(feature = "direct-stack-dispatch")]
+pub use stack_dispatch::{
+    CanonicalArbEvm, CanonicalStackInstructions, StackDispatchMode, StackDispatchStats,
+};
 pub use storage::{
     AddressSet, AddressTable, ArbBlockHeaderInfo, ArbFeatures, ArbosPrograms, ArbosState,
     BatchPosterState, BatchPosterTable, BlockHashes, ChainConfig, L1Pricing, L2Pricing,
