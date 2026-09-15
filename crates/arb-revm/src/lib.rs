@@ -17,6 +17,8 @@ pub mod api;
 pub mod arb_journal;
 pub mod arbos_init;
 pub mod chain;
+#[cfg(feature = "compiled-frame")]
+pub mod compiled_frame;
 pub mod constants;
 mod deposit_tx;
 pub mod evm;
@@ -42,6 +44,10 @@ pub use api::{
     default_ctx::{ArbContext, DefaultArb},
 };
 pub use chain::ArbChainContext;
+#[cfg(feature = "compiled-frame")]
+pub use compiled_frame::{
+    CompiledFrameError, CompiledFrameRegistry, IneligibleReason, bytecode_ineligible,
+};
 pub use evm::ArbEvm;
 pub use executor::{
     ArbExecCfg, ArbExecOutcome, ArbExecutionHooks, ArbExecutionInput, ArbExecutionMode,

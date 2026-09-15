@@ -16,7 +16,7 @@ use revm::{
     inspector::{
         InspectCommitEvm, InspectEvm, InspectSystemCallEvm, Inspector, InspectorHandler, JournalExt,
     },
-    interpreter::{InterpreterResult, interpreter::EthInterpreter},
+    interpreter::{Host, InterpreterResult, interpreter::EthInterpreter},
     primitives::{Address, Bytes},
     state::EvmState,
 };
@@ -48,7 +48,7 @@ pub type ArbError<CTX> = EVMError<<<CTX as ContextTr>::Db as Database>::Error, I
 impl<CTX, INSP, PRECOMPILE> ExecuteEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr + ContextSetters,
+    CTX: ArbContextTr + ContextSetters + Host,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     type Tx = <CTX as ContextTr>::Tx;
@@ -85,7 +85,7 @@ where
 impl<CTX, INSP, PRECOMPILE> ExecuteCommitEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Db: DatabaseCommit> + ContextSetters,
+    CTX: ArbContextTr<Db: DatabaseCommit> + ContextSetters + Host,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     fn commit(&mut self, state: Self::State) {
@@ -96,7 +96,7 @@ where
 impl<CTX, INSP, PRECOMPILE> InspectEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Journal: JournalExt> + ContextSetters,
+    CTX: ArbContextTr<Journal: JournalExt> + ContextSetters + Host,
     INSP: Inspector<CTX, EthInterpreter>,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -116,7 +116,7 @@ where
 impl<CTX, INSP, PRECOMPILE> InspectCommitEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Journal: JournalExt, Db: DatabaseCommit> + ContextSetters,
+    CTX: ArbContextTr<Journal: JournalExt, Db: DatabaseCommit> + ContextSetters + Host,
     INSP: Inspector<CTX, EthInterpreter>,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -125,7 +125,7 @@ where
 impl<CTX, INSP, PRECOMPILE> SystemCallEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Tx: SystemCallTx> + ContextSetters,
+    CTX: ArbContextTr<Tx: SystemCallTx> + ContextSetters + Host,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     fn system_call_one_with_caller(
@@ -147,7 +147,7 @@ where
 impl<CTX, INSP, PRECOMPILE> InspectSystemCallEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Journal: JournalExt, Tx: SystemCallTx> + ContextSetters,
+    CTX: ArbContextTr<Journal: JournalExt, Tx: SystemCallTx> + ContextSetters + Host,
     INSP: Inspector<CTX, EthInterpreter>,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -170,7 +170,7 @@ where
 impl<CTX, INSP, PRECOMPILE> SystemCallCommitEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Db: DatabaseCommit, Tx: SystemCallTx> + ContextSetters,
+    CTX: ArbContextTr<Db: DatabaseCommit, Tx: SystemCallTx> + ContextSetters + Host,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     fn system_call_with_caller_commit(

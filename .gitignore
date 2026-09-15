@@ -1,4 +1,5 @@
 /target
+.local/
 # Ignore all testdata (large replay fixtures) except the small digest test fixtures.
 /testdata/*
 !/testdata/fixtures/

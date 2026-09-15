@@ -2,6 +2,8 @@ use crate::{
     ArbSpecId, api::exec::ArbContextTr, chain::ArbChainContext, precompiles::ArbPrecompiles,
     storage::ArbosState,
 };
+#[cfg(feature = "compiled-frame")]
+use revm::interpreter::InterpreterAction;
 use revm::{
     Database, Inspector,
     bytecode::opcode,
@@ -62,6 +64,10 @@ where
 }
 
 /// Arbitrum EVM wrapper over revm's generic [`Evm`] type.
+///
+/// The optional second field is the compiled-frame registry. It is present only
+/// with `--features compiled-frame` and is `None` unless a caller attaches one.
+/// Missing/empty registries execute the original interpreter path.
 #[derive(Debug, Clone)]
 pub struct ArbEvm<
     CTX,
@@ -69,7 +75,11 @@ pub struct ArbEvm<
     I = EthInstructions<EthInterpreter, CTX>,
     P = ArbPrecompiles,
     F = EthFrame<EthInterpreter>,
->(pub Evm<CTX, INSP, I, P, F>);
+>(
+    pub Evm<CTX, INSP, I, P, F>,
+    #[cfg(feature = "compiled-frame")]
+    Option<std::sync::Arc<crate::compiled_frame::CompiledFrameRegistry>>,
+);
 
 impl<CTX, INSP> ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, ArbPrecompiles>
 where
@@ -91,13 +101,17 @@ where
             Instruction::new(arb_block_hash::<CTX>),
             20,
         );
-        Self(Evm {
-            ctx,
-            inspector,
-            instruction,
-            precompiles: ArbPrecompiles::new_with_spec(spec),
-            frame_stack: FrameStack::new_prealloc(8),
-        })
+        Self(
+            Evm {
+                ctx,
+                inspector,
+                instruction,
+                precompiles: ArbPrecompiles::new_with_spec(spec),
+                frame_stack: FrameStack::new_prealloc(8),
+            },
+            #[cfg(feature = "compiled-frame")]
+            None,
+        )
     }
 
     /// Consumes self and returns the inner context.
@@ -109,12 +123,40 @@ where
 impl<CTX, INSP, I, P> ArbEvm<CTX, INSP, I, P> {
     /// Consumes self and returns a new EVM with a different inspector.
     pub fn with_inspector<OINSP>(self, inspector: OINSP) -> ArbEvm<CTX, OINSP, I, P> {
-        ArbEvm(self.0.with_inspector(inspector))
+        ArbEvm(
+            self.0.with_inspector(inspector),
+            #[cfg(feature = "compiled-frame")]
+            self.1,
+        )
     }
 
     /// Consumes self and returns a new EVM with a different precompile provider.
     pub fn with_precompiles<OP>(self, precompiles: OP) -> ArbEvm<CTX, INSP, I, OP> {
-        ArbEvm(self.0.with_precompiles(precompiles))
+        ArbEvm(
+            self.0.with_precompiles(precompiles),
+            #[cfg(feature = "compiled-frame")]
+            self.1,
+        )
+    }
+
+    /// Attaches a warm-compiled program registry. No-op type when the feature is off.
+    ///
+    /// `None` or an empty registry keeps the original interpreter path. Do not compile
+    /// from this method; compile on the registry before sharing it.
+    #[cfg(feature = "compiled-frame")]
+    pub fn set_compiled_programs(
+        &mut self,
+        registry: Option<std::sync::Arc<crate::compiled_frame::CompiledFrameRegistry>>,
+    ) {
+        self.1 = registry;
+    }
+
+    /// Returns the attached compiled-frame registry, if any.
+    #[cfg(feature = "compiled-frame")]
+    pub fn compiled_programs(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::compiled_frame::CompiledFrameRegistry>> {
+        self.1.as_ref()
     }
 
     /// Consumes self and returns the inner inspector.
@@ -157,9 +199,29 @@ where
     }
 }
 
+#[cfg(feature = "compiled-frame")]
+impl<CTX, INSP, I, P> ArbEvm<CTX, INSP, I, P, EthFrame<EthInterpreter>>
+where
+    CTX: ArbContextTr + Host,
+    I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
+    P: PrecompileProvider<CTX, Output = InterpreterResult>,
+{
+    fn try_compiled_frame_action(&mut self) -> Option<InterpreterAction> {
+        let registry = self.1.as_ref()?;
+        if registry.is_empty() {
+            return None;
+        }
+        let spec = self.0.ctx.cfg().spec();
+        if !registry.accepts_context(spec, self.0.ctx.cfg().gas_params()) {
+            return None;
+        }
+        crate::compiled_frame::try_execute(registry, self.0.frame_stack.get(), &mut self.0.ctx)
+    }
+}
+
 impl<CTX, INSP, I, P> EvmTr for ArbEvm<CTX, INSP, I, P, EthFrame<EthInterpreter>>
 where
-    CTX: ArbContextTr,
+    CTX: ArbContextTr + Host,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -233,6 +295,18 @@ where
             self.0.ctx.cfg().spec().arbos_version(),
         ) && let Some(action) = self.frame_run_stylus()
         {
+            let frame = self.0.frame_stack.get();
+            let context = &mut self.0.ctx;
+            return frame.process_next_action(context, action).inspect(|next| {
+                if next.is_result() {
+                    frame.set_finished(true);
+                }
+            });
+        }
+        // Optional compiled-program dispatch. Lookup only — never compiles here.
+        // Nested frames are checked because the handler loop calls `frame_run` for each.
+        #[cfg(feature = "compiled-frame")]
+        if let Some(action) = self.try_compiled_frame_action() {
             let frame = self.0.frame_stack.get();
             let context = &mut self.0.ctx;
             return frame.process_next_action(context, action).inspect(|next| {
