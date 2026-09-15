@@ -16,7 +16,7 @@ use revm::{
     inspector::{
         InspectCommitEvm, InspectEvm, InspectSystemCallEvm, Inspector, InspectorHandler, JournalExt,
     },
-    interpreter::{Host, InterpreterResult, interpreter::EthInterpreter},
+    interpreter::{InterpreterResult, interpreter::EthInterpreter},
     primitives::{Address, Bytes},
     state::EvmState,
 };
@@ -42,13 +42,28 @@ impl<T> ArbContextTr for T where
 {
 }
 
+/// Extra `ArbEvm` bound used only by compiled-frame dispatch.
+///
+/// Default-off: implemented for every type, so `ExecuteEvm` / `EvmTr` stay as
+/// `CTX: ArbContextTr + …` with no `Host` requirement. With `compiled-frame`,
+/// this is `Host` because `EvmCompilerFn::call_with_interpreter` needs it.
+#[cfg(feature = "compiled-frame")]
+pub trait CompiledFrameCtx: revm::interpreter::Host {}
+#[cfg(feature = "compiled-frame")]
+impl<T: revm::interpreter::Host> CompiledFrameCtx for T {}
+
+#[cfg(not(feature = "compiled-frame"))]
+pub trait CompiledFrameCtx {}
+#[cfg(not(feature = "compiled-frame"))]
+impl<T> CompiledFrameCtx for T {}
+
 /// Error type for Arbitrum EVM execution.
 pub type ArbError<CTX> = EVMError<<<CTX as ContextTr>::Db as Database>::Error, InvalidTransaction>;
 
 impl<CTX, INSP, PRECOMPILE> ExecuteEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr + ContextSetters + Host,
+    CTX: ArbContextTr + ContextSetters + CompiledFrameCtx,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     type Tx = <CTX as ContextTr>::Tx;
@@ -85,7 +100,7 @@ where
 impl<CTX, INSP, PRECOMPILE> ExecuteCommitEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Db: DatabaseCommit> + ContextSetters + Host,
+    CTX: ArbContextTr<Db: DatabaseCommit> + ContextSetters + CompiledFrameCtx,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     fn commit(&mut self, state: Self::State) {
@@ -96,7 +111,7 @@ where
 impl<CTX, INSP, PRECOMPILE> InspectEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Journal: JournalExt> + ContextSetters + Host,
+    CTX: ArbContextTr<Journal: JournalExt> + ContextSetters + CompiledFrameCtx,
     INSP: Inspector<CTX, EthInterpreter>,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -116,7 +131,7 @@ where
 impl<CTX, INSP, PRECOMPILE> InspectCommitEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Journal: JournalExt, Db: DatabaseCommit> + ContextSetters + Host,
+    CTX: ArbContextTr<Journal: JournalExt, Db: DatabaseCommit> + ContextSetters + CompiledFrameCtx,
     INSP: Inspector<CTX, EthInterpreter>,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -125,7 +140,7 @@ where
 impl<CTX, INSP, PRECOMPILE> SystemCallEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Tx: SystemCallTx> + ContextSetters + Host,
+    CTX: ArbContextTr<Tx: SystemCallTx> + ContextSetters + CompiledFrameCtx,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     fn system_call_one_with_caller(
@@ -147,7 +162,7 @@ where
 impl<CTX, INSP, PRECOMPILE> InspectSystemCallEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Journal: JournalExt, Tx: SystemCallTx> + ContextSetters + Host,
+    CTX: ArbContextTr<Journal: JournalExt, Tx: SystemCallTx> + ContextSetters + CompiledFrameCtx,
     INSP: Inspector<CTX, EthInterpreter>,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -170,7 +185,7 @@ where
 impl<CTX, INSP, PRECOMPILE> SystemCallCommitEvm
     for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
 where
-    CTX: ArbContextTr<Db: DatabaseCommit, Tx: SystemCallTx> + ContextSetters + Host,
+    CTX: ArbContextTr<Db: DatabaseCommit, Tx: SystemCallTx> + ContextSetters + CompiledFrameCtx,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
     fn system_call_with_caller_commit(

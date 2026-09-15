@@ -1,5 +1,8 @@
 use crate::{
-    ArbSpecId, api::exec::ArbContextTr, chain::ArbChainContext, precompiles::ArbPrecompiles,
+    ArbSpecId,
+    api::exec::{ArbContextTr, CompiledFrameCtx},
+    chain::ArbChainContext,
+    precompiles::ArbPrecompiles,
     storage::ArbosState,
 };
 #[cfg(feature = "compiled-frame")]
@@ -63,6 +66,14 @@ where
     Ok(())
 }
 
+/// Opcodes whose instruction-table entries `ArbEvm::new` replaces.
+///
+/// Compiled frames skip the instruction table, so these must be refused by
+/// [`crate::compiled_frame::bytecode_ineligible`]. Kept next to the
+/// `insert_instruction` calls. Sorted numerically. The table-diff test in this
+/// file fails if `ArbEvm::new` grows another override without updating this list.
+pub const ARB_INSTRUCTION_OVERRIDES: &[u8] = &[opcode::BLOCKHASH, opcode::NUMBER];
+
 /// Arbitrum EVM wrapper over revm's generic [`Evm`] type.
 ///
 /// The optional second field is the compiled-frame registry. It is present only
@@ -101,17 +112,17 @@ where
             Instruction::new(arb_block_hash::<CTX>),
             20,
         );
-        Self(
-            Evm {
-                ctx,
-                inspector,
-                instruction,
-                precompiles: ArbPrecompiles::new_with_spec(spec),
-                frame_stack: FrameStack::new_prealloc(8),
-            },
-            #[cfg(feature = "compiled-frame")]
-            None,
-        )
+        debug_assert_eq!(
+            ARB_INSTRUCTION_OVERRIDES,
+            &[opcode::BLOCKHASH, opcode::NUMBER]
+        );
+        Self::from_inner(Evm {
+            ctx,
+            inspector,
+            instruction,
+            precompiles: ArbPrecompiles::new_with_spec(spec),
+            frame_stack: FrameStack::new_prealloc(8),
+        })
     }
 
     /// Consumes self and returns the inner context.
@@ -121,6 +132,20 @@ where
 }
 
 impl<CTX, INSP, I, P> ArbEvm<CTX, INSP, I, P> {
+    /// Wraps an inner revm [`Evm`]. With `compiled-frame` the registry starts empty
+    /// (interpreter path). Prefer this over `ArbEvm(inner)` from other crates: enabling
+    /// the feature adds a private field and the one-argument tuple constructor stops
+    /// compiling outside this crate.
+    pub fn from_inner(
+        inner: Evm<CTX, INSP, I, P, EthFrame<EthInterpreter>>,
+    ) -> ArbEvm<CTX, INSP, I, P> {
+        ArbEvm(
+            inner,
+            #[cfg(feature = "compiled-frame")]
+            None,
+        )
+    }
+
     /// Consumes self and returns a new EVM with a different inspector.
     pub fn with_inspector<OINSP>(self, inspector: OINSP) -> ArbEvm<CTX, OINSP, I, P> {
         ArbEvm(
@@ -221,7 +246,7 @@ where
 
 impl<CTX, INSP, I, P> EvmTr for ArbEvm<CTX, INSP, I, P, EthFrame<EthInterpreter>>
 where
-    CTX: ArbContextTr + Host,
+    CTX: ArbContextTr + CompiledFrameCtx,
     I: InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>,
     P: PrecompileProvider<CTX, Output = InterpreterResult>,
 {
@@ -362,5 +387,56 @@ fn span_address(input: &FrameInput) -> Option<Address> {
             Some(call.target_address)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod instruction_table_diff {
+    use super::ARB_INSTRUCTION_OVERRIDES;
+    use crate::{ArbBuilder, ArbContext, ArbSpecId, DefaultArb};
+    use revm::{
+        context::CfgEnv,
+        database::{CacheDB, EmptyDB},
+        handler::instructions::EthInstructions,
+        interpreter::{Instruction, interpreter::EthInterpreter},
+    };
+    use std::mem::{size_of, size_of_val};
+
+    fn instruction_fn_addr<H>(inst: Instruction<EthInterpreter, H>) -> usize {
+        assert_eq!(size_of_val(&inst), size_of::<usize>());
+        // Instruction is a single function pointer; used only to detect table patches.
+        unsafe { std::mem::transmute_copy(&inst) }
+    }
+
+    #[test]
+    fn arb_overrides_are_exactly_number_and_blockhash() {
+        let mut db = CacheDB::new(EmptyDB::default());
+        let ctx = ArbContext::arb()
+            .with_db(&mut db)
+            .with_cfg(CfgEnv::new_with_spec(ArbSpecId::NITRO));
+        let evm = ctx.build_arb();
+        let spec = ArbSpecId::NITRO.into_eth_spec();
+        type Host<'a> = ArbContext<&'a mut CacheDB<EmptyDB>>;
+        let baseline = EthInstructions::<EthInterpreter, Host<'_>>::new_mainnet_with_spec(spec);
+
+        let arb_ins = evm.0.instruction.instruction_table();
+        let base_ins = baseline.instruction_table();
+        let arb_gas = evm.0.instruction.gas_table();
+        let base_gas = baseline.gas_table();
+
+        let mut diffs = Vec::new();
+        for op in 0u8..=255 {
+            let fn_diff = instruction_fn_addr(arb_ins[op as usize])
+                != instruction_fn_addr(base_ins[op as usize]);
+            let gas_diff = arb_gas[op as usize] != base_gas[op as usize];
+            if fn_diff || gas_diff {
+                diffs.push(op);
+            }
+        }
+        assert_eq!(
+            diffs.as_slice(),
+            ARB_INSTRUCTION_OVERRIDES,
+            "every instruction-table/gas-table difference must be in ARB_INSTRUCTION_OVERRIDES"
+        );
     }
 }

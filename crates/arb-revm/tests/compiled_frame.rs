@@ -9,8 +9,8 @@
 
 use arb_revm::transaction::arb_envelope_to_tx_env;
 use arb_revm::{
-    ArbBuilder, ArbChainContext, ArbContext, ArbSpecId, ArbTransaction, CompiledFrameRegistry,
-    DefaultArb, bytecode_ineligible,
+    ARB_INSTRUCTION_OVERRIDES, ArbBuilder, ArbChainContext, ArbContext, ArbSpecId, ArbTransaction,
+    CompiledFrameRegistry, DefaultArb, bytecode_ineligible,
 };
 use arbitrum_alloy_consensus::transactions::{ArbTxEnvelope, TxUnsigned};
 use revm::{
@@ -169,26 +169,60 @@ fn warm_compile(spec: ArbSpecId, codes: &[&[u8]]) -> Arc<CompiledFrameRegistry> 
 }
 
 fn assert_same_outcome(interpreted: &ExecutionResult, compiled: &ExecutionResult) {
-    assert_eq!(
-        interpreted.tx_gas_used(),
-        compiled.tx_gas_used(),
-        "gas_used mismatch\ninterpreted={interpreted:?}\ncompiled={compiled:?}"
-    );
-    assert_eq!(
-        interpreted.output(),
-        compiled.output(),
-        "output mismatch\ninterpreted={interpreted:?}\ncompiled={compiled:?}"
-    );
-    assert_eq!(
-        interpreted.is_success(),
-        compiled.is_success(),
-        "success mismatch\ninterpreted={interpreted:?}\ncompiled={compiled:?}"
-    );
-    assert_eq!(
-        interpreted.is_halt(),
-        compiled.is_halt(),
-        "halt mismatch\ninterpreted={interpreted:?}\ncompiled={compiled:?}"
-    );
+    match (interpreted, compiled) {
+        (
+            ExecutionResult::Success {
+                reason: ra,
+                gas: ga,
+                logs: la,
+                output: oa,
+            },
+            ExecutionResult::Success {
+                reason: rb,
+                gas: gb,
+                logs: lb,
+                output: ob,
+            },
+        ) => {
+            assert_eq!(ra, rb, "success reason");
+            assert_eq!(ga, gb, "success gas");
+            assert_eq!(la, lb, "success logs");
+            assert_eq!(oa, ob, "success output");
+        }
+        (
+            ExecutionResult::Revert {
+                gas: ga,
+                logs: la,
+                output: oa,
+            },
+            ExecutionResult::Revert {
+                gas: gb,
+                logs: lb,
+                output: ob,
+            },
+        ) => {
+            assert_eq!(ga, gb, "revert gas");
+            assert_eq!(la, lb, "revert logs");
+            assert_eq!(oa, ob, "revert output");
+        }
+        (
+            ExecutionResult::Halt {
+                reason: ra,
+                gas: ga,
+                logs: la,
+            },
+            ExecutionResult::Halt {
+                reason: rb,
+                gas: gb,
+                logs: lb,
+            },
+        ) => {
+            assert_eq!(ra, rb, "halt reason");
+            assert_eq!(ga, gb, "halt gas");
+            assert_eq!(la, lb, "halt logs");
+        }
+        _ => panic!("result variant mismatch\ninterpreted={interpreted:?}\ncompiled={compiled:?}"),
+    }
 }
 
 #[test]
@@ -289,18 +323,24 @@ fn compiled_nested_call_matches_interpreter() {
     let interpreted = transact_call(&mut db_i, CONTRACT, 200_000, None);
 
     let mut db_c = CacheDB::new(EmptyDB::default());
-    insert_code(&mut db_c, CALLEE, callee_code);
-    insert_code(&mut db_c, CONTRACT, caller_code);
+    insert_code(&mut db_c, CALLEE, callee_code.clone());
+    insert_code(&mut db_c, CONTRACT, caller_code.clone());
     let compiled = transact_call(&mut db_c, CONTRACT, 200_000, Some(registry.clone()));
 
     assert!(interpreted.is_success(), "{interpreted:?}");
     assert_same_outcome(&interpreted, &compiled);
     assert_eq!(compiled.output(), Some(&word32(0x2a)));
-    // Caller frame + callee frame.
+    let caller_hash = keccak256(&caller_code);
+    let callee_hash = keccak256(&callee_code);
     assert!(
-        registry.dispatch_hits() >= 2,
-        "nested frames should both dispatch, hits={}",
-        registry.dispatch_hits()
+        registry.dispatch_hits_for(caller_hash) >= 1,
+        "caller must dispatch, hits={}",
+        registry.dispatch_hits_for(caller_hash)
+    );
+    assert!(
+        registry.dispatch_hits_for(callee_hash) >= 1,
+        "callee must dispatch compiled, hits={}",
+        registry.dispatch_hits_for(callee_hash)
     );
 }
 
@@ -378,4 +418,175 @@ fn push_immediate_with_number_byte_compiles_and_matches() {
     assert_same_outcome(&interpreted, &compiled);
     assert_eq!(compiled.output(), Some(&word32(0x43)));
     assert!(registry.dispatch_hits() >= 1);
+}
+
+#[test]
+fn denylist_covers_arb_instruction_overrides() {
+    assert_eq!(
+        ARB_INSTRUCTION_OVERRIDES,
+        &[0x40, 0x43],
+        "must stay aligned with evm.rs insert_instruction + table-diff test"
+    );
+    for &op in ARB_INSTRUCTION_OVERRIDES {
+        assert!(
+            bytecode_ineligible(&[op, 0x00]).is_some(),
+            "override opcode 0x{op:02x} must be ineligible"
+        );
+    }
+}
+
+/// GAS followed by MSTORE/RETURN in the same basic block. If a gas section
+/// precharged those later static costs, the GAS value (and output) would diverge.
+#[test]
+fn compiled_gas_opcode_matches_interpreter_with_trailing_static_ops() {
+    let code = Bytes::from(vec![
+        0x60, 0x01, 0x60, 0x02, 0x01, // PUSH1 1 PUSH1 2 ADD
+        0x5a, // GAS
+        0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+    ]);
+    let registry = warm_compile(ArbSpecId::NITRO, &[code.as_ref()]);
+    let mut db_i = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_i, CONTRACT, code.clone());
+    let interpreted = transact_call(&mut db_i, CONTRACT, 100_000, None);
+    let mut db_c = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_c, CONTRACT, code);
+    let compiled = transact_call(&mut db_c, CONTRACT, 100_000, Some(registry.clone()));
+    assert!(interpreted.is_success(), "{interpreted:?}");
+    assert_same_outcome(&interpreted, &compiled);
+    assert!(registry.dispatch_hits() >= 1);
+}
+
+/// EIP-2200 sentry: SSTORE fails if gas left ≤ 2300. Trailing PUSH/POP after
+/// SSTORE must not be precharged into that remaining-gas check.
+#[test]
+fn compiled_sstore_sentry_matches_interpreter() {
+    // PUSH1 1 PUSH1 0 SSTORE PUSH1 0xff POP STOP — slot already 1 (no-op SSTORE).
+    let code = Bytes::from(vec![0x60, 0x01, 0x60, 0x00, 0x55, 0x60, 0xff, 0x50, 0x00]);
+    let registry = warm_compile(ArbSpecId::NITRO, &[code.as_ref()]);
+    // 21_000 intrinsic + 2×PUSH1 (6) + 2301 remaining at SSTORE.
+    let just_above_sentry = 21_000 + 6 + 2_301;
+
+    for gas_limit in [just_above_sentry, just_above_sentry - 1, 100_000_u64] {
+        let mut db_i = CacheDB::new(EmptyDB::default());
+        insert_code(&mut db_i, CONTRACT, code.clone());
+        db_i.insert_account_storage(CONTRACT, U256::ZERO, U256::from(1))
+            .unwrap();
+        let interpreted = transact(&mut db_i, unsigned_call(CONTRACT, gas_limit), None);
+
+        let mut db_c = CacheDB::new(EmptyDB::default());
+        insert_code(&mut db_c, CONTRACT, code.clone());
+        db_c.insert_account_storage(CONTRACT, U256::ZERO, U256::from(1))
+            .unwrap();
+        let compiled = transact(
+            &mut db_c,
+            unsigned_call(CONTRACT, gas_limit),
+            Some(registry.clone()),
+        );
+
+        assert_same_outcome(&interpreted.result, &compiled.result);
+        assert_eq!(
+            slot0(&interpreted.state, CONTRACT),
+            slot0(&compiled.state, CONTRACT),
+            "storage diverged at gas_limit={gas_limit}"
+        );
+    }
+    assert!(registry.dispatch_hits() >= 1);
+}
+
+/// CALL stipend is `GAS` (exact remaining), so 63/64 forwarding is observable
+/// via the callee's returned GAS value.
+#[test]
+fn compiled_call_gas_stipend_matches_interpreter() {
+    let callee_code = Bytes::from(vec![
+        0x5a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, // GAS, return it
+    ]);
+    let mut caller_code = vec![
+        0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+    ];
+    caller_code.extend_from_slice(CALLEE.as_slice());
+    caller_code.extend_from_slice(&[
+        0x5a, // GAS as stipend
+        0xf1, // CALL
+        0x60, 0x20, 0x60, 0x00, 0xf3,
+    ]);
+    let caller_code = Bytes::from(caller_code);
+    let registry = warm_compile(
+        ArbSpecId::NITRO,
+        &[callee_code.as_ref(), caller_code.as_ref()],
+    );
+
+    let mut db_i = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_i, CALLEE, callee_code.clone());
+    insert_code(&mut db_i, CONTRACT, caller_code.clone());
+    let interpreted = transact_call(&mut db_i, CONTRACT, 200_000, None);
+
+    let mut db_c = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_c, CALLEE, callee_code.clone());
+    insert_code(&mut db_c, CONTRACT, caller_code.clone());
+    let compiled = transact_call(&mut db_c, CONTRACT, 200_000, Some(registry.clone()));
+
+    assert!(interpreted.is_success(), "{interpreted:?}");
+    assert_same_outcome(&interpreted, &compiled);
+    assert!(
+        registry.dispatch_hits_for(keccak256(&callee_code)) >= 1,
+        "callee must run compiled"
+    );
+    assert!(
+        registry.dispatch_hits_for(keccak256(&caller_code)) >= 1,
+        "caller must run compiled"
+    );
+}
+
+#[test]
+fn compiled_revert_keeps_remaining_gas() {
+    let code = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]); // PUSH1 0 PUSH1 0 REVERT
+    let registry = warm_compile(ArbSpecId::NITRO, &[code.as_ref()]);
+    let mut db_i = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_i, CONTRACT, code.clone());
+    let interpreted = transact_call(&mut db_i, CONTRACT, 100_000, None);
+    let mut db_c = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_c, CONTRACT, code);
+    let compiled = transact_call(&mut db_c, CONTRACT, 100_000, Some(registry));
+    assert!(
+        matches!(interpreted, ExecutionResult::Revert { .. }),
+        "{interpreted:?}"
+    );
+    assert!(interpreted.tx_gas_used() < 100_000);
+    assert_same_outcome(&interpreted, &compiled);
+}
+
+/// Reverted child CALL must resume the compiled caller with the same success flag.
+#[test]
+fn compiled_caller_resumes_after_reverted_child() {
+    let callee_code = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]);
+    let mut caller_code = vec![
+        0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+    ];
+    caller_code.extend_from_slice(CALLEE.as_slice());
+    caller_code.extend_from_slice(&[
+        0x61, 0x40, 0x00, 0xf1, // PUSH2 gas, CALL
+        0x15, // ISZERO
+        0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+    ]);
+    let caller_code = Bytes::from(caller_code);
+    let registry = warm_compile(
+        ArbSpecId::NITRO,
+        &[callee_code.as_ref(), caller_code.as_ref()],
+    );
+
+    let mut db_i = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_i, CALLEE, callee_code.clone());
+    insert_code(&mut db_i, CONTRACT, caller_code.clone());
+    let interpreted = transact_call(&mut db_i, CONTRACT, 200_000, None);
+
+    let mut db_c = CacheDB::new(EmptyDB::default());
+    insert_code(&mut db_c, CALLEE, callee_code.clone());
+    insert_code(&mut db_c, CONTRACT, caller_code.clone());
+    let compiled = transact_call(&mut db_c, CONTRACT, 200_000, Some(registry.clone()));
+
+    assert!(interpreted.is_success(), "{interpreted:?}");
+    assert_eq!(interpreted.output(), Some(&word32(1)));
+    assert_same_outcome(&interpreted, &compiled);
+    assert!(registry.dispatch_hits_for(keccak256(&caller_code)) >= 2);
+    assert!(registry.dispatch_hits_for(keccak256(&callee_code)) >= 1);
 }

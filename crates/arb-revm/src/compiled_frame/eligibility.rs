@@ -1,6 +1,7 @@
 //! Conservative compile eligibility. Decoding skips PUSH (and other) immediates.
 
-use revm::bytecode::opcode::{self, OPCODE_INFO};
+use crate::evm::ARB_INSTRUCTION_OVERRIDES;
+use revm::bytecode::opcode::OPCODE_INFO;
 
 /// Why a bytecode image is refused for compilation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,10 +11,10 @@ pub enum IneligibleReason {
     /// `0xEF` prefix: EOF or a Stylus discriminant. Stylus is handled before this
     /// path; EOF is out of scope for the prototype.
     EofOrStylusPrefix,
-    /// `NUMBER` (0x43). ArbOS returns the L1 block number; revmc's builtin uses L2.
-    NumberOpcode,
-    /// `BLOCKHASH` (0x40). ArbOS reads the L1 hash ring; revmc's builtin uses L2 hashes.
-    BlockhashOpcode,
+    /// Opcode whose ArbEvm instruction-table entry differs from mainnet.
+    /// Compiled code skips that table; revmc builtins for NUMBER/BLOCKHASH use
+    /// `Host::{block_number,block_hash}` (L2), not the L1 instruction overrides.
+    InstructionOverride(u8),
 }
 
 /// Returns `Some` when `code` must not be compiled.
@@ -31,10 +32,8 @@ pub fn bytecode_ineligible(code: &[u8]) -> Option<IneligibleReason> {
     let mut i = 0;
     while i < code.len() {
         let op = code[i];
-        match op {
-            opcode::NUMBER => return Some(IneligibleReason::NumberOpcode),
-            opcode::BLOCKHASH => return Some(IneligibleReason::BlockhashOpcode),
-            _ => {}
+        if ARB_INSTRUCTION_OVERRIDES.contains(&op) {
+            return Some(IneligibleReason::InstructionOverride(op));
         }
         let immediate = OPCODE_INFO[op as usize]
             .map(|info| info.immediate_size() as usize)
@@ -62,11 +61,11 @@ mod tests {
     fn number_and_blockhash_opcodes_are_ineligible() {
         assert_eq!(
             bytecode_ineligible(&[opcode::NUMBER, opcode::STOP]),
-            Some(IneligibleReason::NumberOpcode)
+            Some(IneligibleReason::InstructionOverride(opcode::NUMBER))
         );
         assert_eq!(
             bytecode_ineligible(&[opcode::BLOCKHASH, opcode::STOP]),
-            Some(IneligibleReason::BlockhashOpcode)
+            Some(IneligibleReason::InstructionOverride(opcode::BLOCKHASH))
         );
     }
 
@@ -103,7 +102,7 @@ mod tests {
     fn number_after_push_is_still_detected() {
         assert_eq!(
             bytecode_ineligible(&[opcode::PUSH1, 0x01, opcode::NUMBER, opcode::STOP]),
-            Some(IneligibleReason::NumberOpcode)
+            Some(IneligibleReason::InstructionOverride(opcode::NUMBER))
         );
     }
 }

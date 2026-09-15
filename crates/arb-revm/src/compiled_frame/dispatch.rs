@@ -26,8 +26,10 @@ pub(crate) fn try_execute<H: Host>(
     }
 
     let code_hash = frame.interpreter.bytecode.get_or_calculate_hash();
-    let func = registry.lookup(code_hash)?;
-    registry.record_dispatch_hit();
+    // `Bytecode::len` is original_len (no JUMPDEST padding). `bytes().len()` includes padding
+    // and would miss every compiled program.
+    let live_len = frame.interpreter.bytecode.len();
+    let func = registry.lookup(code_hash, live_len)?;
 
     // SAFETY: `func` was produced by `registry.compiler.jit` and the compiler
     // artifact is borrowed here through `registry`. `call_with_interpreter`

@@ -58,18 +58,26 @@ pub struct CompiledFrameIdentity {
     pub compiler_runtime: &'static str,
 }
 
+struct CompiledProgram {
+    func: EvmCompilerFn,
+    code_len: usize,
+    hits: AtomicU64,
+}
+
 /// Owns an LLVM JIT module and every `EvmCompilerFn` produced from it.
 ///
 /// Function pointers are never stored without this owner. [`compile`](Self::compile)
 /// is the only insertion path. Do not call [`compile`](Self::compile) from
 /// `frame_run`; warm-compile outside replay and then share the registry.
+///
+/// Not `Sync` (LLVM context). `Arc` is for sharing on one thread after warm
+/// compile; this crate does not `unsafe impl Send/Sync`.
 pub struct CompiledFrameRegistry {
     compiler: EvmCompiler<revmc::EvmLlvmBackend>,
-    programs: HashMap<B256, EvmCompilerFn>,
+    programs: HashMap<B256, CompiledProgram>,
     identity: CompiledFrameIdentity,
     gas_params: GasParams,
     last_timings: Option<CompileTimings>,
-    dispatch_hits: AtomicU64,
 }
 
 impl fmt::Debug for CompiledFrameRegistry {
@@ -98,6 +106,9 @@ impl CompiledFrameRegistry {
         compiler.set_simple_perf(false);
         compiler.gas_metering(true);
         compiler.single_error(false);
+        // SAFETY: `true` is the revmc default; set explicitly so COMPILER_IDENTITY
+        // (`stack-checks-on`) matches the instance rather than an implicit default.
+        unsafe { compiler.stack_bound_checks(true) };
         compiler.set_gas_params(gas_params.clone());
         Ok(Self {
             compiler,
@@ -111,7 +122,6 @@ impl CompiledFrameRegistry {
             },
             gas_params,
             last_timings: None,
-            dispatch_hits: AtomicU64::new(0),
         })
     }
 
@@ -167,17 +177,21 @@ impl CompiledFrameRegistry {
         let name = format!("arb_{code_hash}");
         // SAFETY: the returned function is stored only in `self.programs`, and
         // `self.compiler` is never `clear()`ed or dropped while those entries exist.
-        // `clear_ir` keeps JIT machine code resident (see revmc `EvmCompiler::clear_ir`).
-        let func = unsafe {
-            self.compiler
-                .jit(&name, bytecode, self.identity.eth_spec)
-                .map_err(|err| CompiledFrameError::Compiler(err.to_string()))?
-        };
+        // `clear_ir` (ORC) drops IR and keeps committed machine code resident.
+        let jit = unsafe { self.compiler.jit(&name, bytecode, self.identity.eth_spec) };
         self.last_timings = Some(self.compiler.take_timings());
-        self.compiler
-            .clear_ir()
-            .map_err(|err| CompiledFrameError::Compiler(err.to_string()))?;
-        self.programs.insert(code_hash, func);
+        // Always drop leftover IR so a failed jit cannot poison the next compile.
+        let clear = self.compiler.clear_ir();
+        let func = jit.map_err(|err| CompiledFrameError::Compiler(err.to_string()))?;
+        clear.map_err(|err| CompiledFrameError::Compiler(err.to_string()))?;
+        self.programs.insert(
+            code_hash,
+            CompiledProgram {
+                func,
+                code_len: bytecode.len(),
+                hits: AtomicU64::new(0),
+            },
+        );
         Ok(code_hash)
     }
 
@@ -186,17 +200,29 @@ impl CompiledFrameRegistry {
         std::sync::Arc::new(self)
     }
 
-    /// How many times a compiled function was actually entered from `frame_run`.
+    /// How many times compiled functions were entered from `frame_run` (all hashes).
     pub fn dispatch_hits(&self) -> u64 {
-        self.dispatch_hits.load(Ordering::Relaxed)
+        self.programs
+            .values()
+            .map(|p| p.hits.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Hits for one code hash. Distinguishes caller vs callee in nested CALL.
+    pub fn dispatch_hits_for(&self, code_hash: B256) -> u64 {
+        self.programs
+            .get(&code_hash)
+            .map(|p| p.hits.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Looks up a compiled function. Pointers are valid only while `self` is alive.
-    pub(crate) fn lookup(&self, code_hash: B256) -> Option<EvmCompilerFn> {
-        self.programs.get(&code_hash).copied()
-    }
-
-    pub(crate) fn record_dispatch_hit(&self) {
-        self.dispatch_hits.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn lookup(&self, code_hash: B256, live_len: usize) -> Option<EvmCompilerFn> {
+        let program = self.programs.get(&code_hash)?;
+        if program.code_len != live_len {
+            return None;
+        }
+        program.hits.fetch_add(1, Ordering::Relaxed);
+        Some(program.func)
     }
 }

@@ -71,9 +71,21 @@ Compiled only when **all** of these hold:
 Cache key is code hash plus the registry's immutable instance context (ArbOS
 spec, eth spec, target arch/os, compiler/runtime identity, gas table).
 
-Out of coverage for this PoC: inspect/tracing (`inspect_frame_run` is not
-overridden), sync compile on miss, AOT artifacts, substituting `JitEvm`,
-disabling gas metering, collapsing halt reasons (`single_error` is off).
+Inspect/tracing: `InspectorEvmTr::inspect_frame_run` runs `inspect_instructions`
+on the interpreter table and does **not** call `frame_run`. Compiled dispatch
+is skipped under `inspect_*`; traces always show the interpreter.
+
+`ArbContext` does not implement `Host`. Stock `Context` `Host` methods are L2
+(`block_number`, `block_hash`). NUMBER/BLOCKHASH are **instruction-table**
+overrides, which compiled code never sees. revmc builtins go through `Host`,
+so those two opcodes are denylisted. Other env opcodes (COINBASE, DIFFICULTY,
+GASPRICE, …) share `Host` with the interpreter and are not overridden.
+
+revmc `79e3c8ca` ends a gas section at `GAS`, Istanbul+ `SSTORE`, branches, and
+CALL/CREATE (after charging that opcode's own base gas). Trailing static costs
+are a new section, so they should not be precharged into `gasleft`. Differential
+tests cover GAS-then-MSTORE, SSTORE EIP-2200 sentry with trailing PUSH/POP, and
+CALL stipend = `GAS`.
 
 ## Whole-replay criterion
 
@@ -101,13 +113,29 @@ so the module outlives dispatch.
 
 ## Limits that remain
 
-- Inspect/trace path still interprets.
+- Inspect/trace path always interprets (`inspect_frame_run` does not use
+  compiled dispatch). Compiled-path bugs will not show up in `debug_trace`.
 - revmc `NUMBER`/`BLOCKHASH` builtins are L2; we refuse those opcodes rather
   than teaching revmc ArbOS L1 semantics.
+- `Host` is required on `EvmTr`/`ExecuteEvm` **only** with `--features compiled-frame`
+  (`CompiledFrameCtx`). Default-off bounds are unchanged.
+- Enabling `compiled-frame` in a workspace adds a private registry field to
+  `ArbEvm`. External `ArbEvm(inner)` tuple construction then fails to compile;
+  use `ArbEvm::from_inner`.
+- `CompiledFrameRegistry` is not documented as `Send`/`Sync`. revmc's LLVM
+  backend has upstream `unsafe impl Send`; this crate adds none. `Arc` is for
+  single-thread sharing after warm compile.
+- `clear_ir` at this revmc revision replaces the LLVM IR module and does not
+  drop ORC committed machine code. Not a lifetime proof under `clear()`.
+- No debug assertion that a resumed frame stays on the compiled path if `cfg`
+  were to change mid-transaction (handler is not known to do that).
 - Default opt-level / debug-assertion compiler settings are whatever revmc
-  LLVM uses; they affect compile time, not the “did we disable gas” question
-  (gas metering stays on).
-- revmc is pinned to public revision79e3c8ca; no sibling checkout is required.
-  LLVM22 remains a build requirement only when the feature is on.
-- Parity tests cover arithmetic, OOG, SSTORE, nested CALL, initcode skip, miss,
-  spec mismatch, and PUSH-immediate exclusion. They are not a replay corpus.
+  LLVM uses; `stack_bound_checks(true)`, `gas_metering(true)`, `single_error(false)`
+  are set explicitly.
+- revmc is pinned to public revision `79e3c8ca`. LLVM 22 remains a build
+  requirement only when the feature is on.
+- Parity tests cover arithmetic, exact halt reasons, REVERT leftover gas,
+  SSTORE, SSTORE sentry, GAS-then-static-ops, nested CALL (per-hash hits),
+  CALL stipend = GAS, reverted-child resume, initcode skip, miss, spec
+  mismatch, PUSH-immediate exclusion, and the 256-opcode instruction-table
+  diff. They are not a replay corpus. No whole-block speed claim.

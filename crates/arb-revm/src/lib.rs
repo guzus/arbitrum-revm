@@ -48,7 +48,7 @@ pub use chain::ArbChainContext;
 pub use compiled_frame::{
     CompiledFrameError, CompiledFrameRegistry, IneligibleReason, bytecode_ineligible,
 };
-pub use evm::ArbEvm;
+pub use evm::{ARB_INSTRUCTION_OVERRIDES, ArbEvm};
 pub use executor::{
     ArbExecCfg, ArbExecOutcome, ArbExecutionHooks, ArbExecutionInput, ArbExecutionMode,
     ArbMessageEnvelope, ArbParentHeader, ArbRunner, ArbRunnerError, ArbStartBlockDerived,
