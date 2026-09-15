@@ -107,7 +107,7 @@ so the module outlives dispatch.
 - Default opt-level / debug-assertion compiler settings are whatever revmc
   LLVM uses; they affect compile time, not the “did we disable gas” question
   (gas metering stays on).
-- Optional path dependency on the sibling revmc checkout: `cargo` resolves the
-  path even with the feature off; LLVM is not compiled unless the feature is on.
+- revmc is pinned to public revision79e3c8ca; no sibling checkout is required.
+  LLVM22 remains a build requirement only when the feature is on.
 - Parity tests cover arithmetic, OOG, SSTORE, nested CALL, initcode skip, miss,
   spec mismatch, and PUSH-immediate exclusion. They are not a replay corpus.
