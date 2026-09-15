@@ -8,7 +8,7 @@ use crate::{
         L1_PRICER_FUNDS_POOL_ADDRESS,
     },
     deposit_tx, internal_tx,
-    l1_cost::{compute_poster_info, encode_tx_bytes},
+    l1_cost::{compute_poster_info_with_prepared, encode_tx_bytes},
     retry_tx, submit_retryable_tx,
     transaction::ArbTxTr,
     transaction_filter::is_tx_hash_filtered,
@@ -491,6 +491,7 @@ where
             let gas_price = U256::from(evm.ctx().tx().effective_gas_price(basefee_u128));
             let tx_gas_limit = evm.ctx().tx().gas_limit();
             let tx_bytes = encode_tx_bytes(evm.ctx().tx());
+            let prepared = evm.ctx().tx().prepared_poster_compression().cloned();
 
             // Phase 2: mutable context for storage access.
             let ctx = evm.ctx_mut();
@@ -530,12 +531,13 @@ where
                 .get(journal)
                 .unwrap_or(0) as u32;
 
-            let info = compute_poster_info(
+            let info = compute_poster_info_with_prepared(
                 &tx_bytes,
                 coinbase,
                 price_per_unit,
                 paid_gas_price,
                 brotli_level,
+                prepared.as_deref(),
             );
 
             if info.calldata_units > 0 {

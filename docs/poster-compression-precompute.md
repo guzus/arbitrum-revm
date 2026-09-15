@@ -1,15 +1,16 @@
 # Prepared poster compression primitive
 
-This is an opt-in primitive only. No handler caller, node scheduler, worker thread,
-mutable/global cache, runtime flag or deployment is wired by this change. No speedup
+The handler accepts an explicit transaction-local opt-in hint. No node scheduler,
+worker thread, global cache, runtime flag or deployment is wired by this change. No speedup
 is claimed. Existing `compute_poster_info` uses the same synchronous compression
 and fee behavior, without allocating or copying preparation inputs.
 
 `PreparedPosterCompression::prepare(bytes, level, window, dictionary)` computes a
 successful compressed length and retains an owned copy of the exact encoded bytes
 and all requested settings. Fields are private; no state/fee values or unsuccessful
-fallback results are retained. The artifact has no interior mutation and may be
-transferred between workers using ordinary Rust ownership.
+fallback results are retained. Compression inputs and result stay immutable. A relaxed atomic `hit_count()`
+records successful exact-match consumption for diagnostics only; it never affects
+fees. The artifact may be shared through `Arc`.
 
 Use `encode_tx_bytes` to preserve the current canonical EIP-2718-versus-fallback
 selection, including empty output for internal/deposit/submit-retryable/retry
@@ -31,8 +32,8 @@ are process-local typed values, not serialized cache entries.
 A future benchmark must include scheduling, preparation and join costs from block
 availability through execution completion. Clear prepared inputs per replay
 attempt; warming a repeated fixture's compression outside the timer is not a live
-block acceleration result. This primitive alone neither moves work outside the
-execution timer nor changes production behavior.
+block acceleration result. The default empty hint neither moves work outside the execution timer nor changes
+production behavior.
 
 Validation: eight focused `l1_cost::tests` passed on the cached local test target,
 covering settings/bytes mismatches, current fee recomputation, error/nonposter/empty
@@ -41,4 +42,19 @@ and scheduler concurrency validation remain required when a caller is integrated
 
 ```sh
 cargo test --locked -p arb-revm --lib l1_cost::tests -- --test-threads=1
+```
+
+`ArbTransaction::prepared_poster_compression` is an optional `Arc` accessed through
+`ArbTxTr::prepared_poster_compression()` (default `None` for other implementations).
+The handler snapshots this handle before borrowing the journal, reads the actual
+compression level serially, then validates and consumes it. Every fresh conversion,
+builder and system transaction initializes `None`; execution replaces the whole
+transaction even on validation failure. Clones deliberately retain the same hint.
+Transaction equality ignores this execution-only metadata. Callers must explicitly
+clear or replace hints per attempt; retry/system transactions need no preparation.
+Debug output includes sizes/settings, never the encoded transaction bytes.
+
+Propagation checks:
+```sh
+cargo test --locked -p arb-revm --lib prepared_hint_tests -- --test-threads=1
 ```
