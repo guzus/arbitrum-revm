@@ -56,6 +56,9 @@ pub use executor::{
     DefaultArbExecutionHooks, execute_message, execute_message_with_hooks,
 };
 pub use handler::ArbHandler;
+pub use l1_cost::{
+    PosterInfo, PreparedPosterCompression, compute_poster_info_with_prepared, encode_tx_bytes,
+};
 pub use precompiles::ArbPrecompiles;
 pub use revm;
 pub use spec::ArbSpecId;
