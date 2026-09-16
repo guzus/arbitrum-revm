@@ -16,9 +16,7 @@ pub enum IneligibleReason {
     ///
     /// Compiled code skips the instruction table. Unclassified overrides are
     /// refused. NUMBER is bridged (compiled Host `block_number` returns L1).
-    /// BLOCKHASH stays refused: revmc's builtin adds an L2-style 256-block range
-    /// check against `Host::block_number()` then `Host::block_hash()`, which is
-    /// not the ArbOS L1 ring used by the interpreter override.
+    /// BLOCKHASH additionally requires the registry's explicit ArbOS-ring mode.
     InstructionOverride(u8),
 }
 
@@ -29,7 +27,16 @@ pub enum IneligibleReason {
 /// are refused unless explicitly host-bridged. A new insert_instruction missing
 /// from the declaration fails the table-diff test, not a runtime table inspection.
 /// This prototype supports constructor-produced, unmodified instruction tables.
+/// BLOCKHASH is admitted only for the registry's immutable ArbOS-ring compiler mode.
 pub fn bytecode_ineligible(code: &[u8]) -> Option<IneligibleReason> {
+    bytecode_ineligible_with_ring(code, true)
+}
+
+/// Used only by a registry bound to the ArbOS compiler and journal adapter.
+pub(crate) fn bytecode_ineligible_with_ring(
+    code: &[u8],
+    arbos_ring: bool,
+) -> Option<IneligibleReason> {
     if code.is_empty() {
         return Some(IneligibleReason::Empty);
     }
@@ -40,7 +47,9 @@ pub fn bytecode_ineligible(code: &[u8]) -> Option<IneligibleReason> {
     let mut i = 0;
     while i < code.len() {
         let op = code[i];
-        if ARB_INSTRUCTION_OVERRIDES.contains(&op) && !COMPILED_HOST_BRIDGED_OVERRIDES.contains(&op)
+        if ARB_INSTRUCTION_OVERRIDES.contains(&op)
+            && (!COMPILED_HOST_BRIDGED_OVERRIDES.contains(&op)
+                || (op == opcode::BLOCKHASH && !arbos_ring))
         {
             return Some(IneligibleReason::InstructionOverride(op));
         }
@@ -56,7 +65,16 @@ pub fn bytecode_ineligible(code: &[u8]) -> Option<IneligibleReason> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IneligibleReason, bytecode_ineligible};
+    use super::IneligibleReason;
+    fn bytecode_ineligible(code: &[u8]) -> Option<IneligibleReason> {
+        super::bytecode_ineligible_with_ring(code, false)
+    }
+
+    #[test]
+    fn arbos_registry_allows_ring_but_conservative_scan_refuses_it() {
+        assert_eq!(super::bytecode_ineligible(&[0x40, 0x43, 0x00]), None);
+        assert!(bytecode_ineligible(&[0x40, 0x43, 0x00]).is_some());
+    }
     use revm::bytecode::opcode;
 
     #[test]
@@ -104,7 +122,7 @@ mod tests {
     fn every_instruction_override_is_bridged_or_refused() {
         use crate::evm::{ARB_INSTRUCTION_OVERRIDES, COMPILED_HOST_BRIDGED_OVERRIDES};
         for &op in ARB_INSTRUCTION_OVERRIDES {
-            let bridged = COMPILED_HOST_BRIDGED_OVERRIDES.contains(&op);
+            let bridged = COMPILED_HOST_BRIDGED_OVERRIDES.contains(&op) && op != opcode::BLOCKHASH;
             let refused = bytecode_ineligible(&[op, opcode::STOP])
                 == Some(IneligibleReason::InstructionOverride(op));
             assert_ne!(

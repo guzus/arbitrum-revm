@@ -403,14 +403,14 @@ fn spec_mismatch_does_not_dispatch() {
 }
 
 #[test]
-fn excluded_opcodes_rejected_at_compile() {
+fn bridged_opcodes_admitted_at_compile() {
     let mut registry = CompiledFrameRegistry::new(ArbSpecId::NITRO).expect("llvm");
     let number = number_sstore_code();
     let blockhash = vec![0x60, 0x01, 0x40, 0x00];
     assert!(bytecode_ineligible(number.as_ref()).is_none());
-    assert!(bytecode_ineligible(&blockhash).is_some());
+    assert!(bytecode_ineligible(&blockhash).is_none());
     assert!(registry.compile(number.as_ref()).is_ok());
-    assert!(registry.compile(&blockhash).is_err());
+    assert!(registry.compile(&blockhash).is_ok());
 }
 
 #[test]
@@ -442,7 +442,7 @@ fn denylist_covers_arb_instruction_overrides() {
         &[0x40, 0x43],
         "must stay aligned with evm.rs insert_instruction + table-diff test"
     );
-    assert_eq!(COMPILED_HOST_BRIDGED_OVERRIDES, &[0x43]);
+    assert_eq!(COMPILED_HOST_BRIDGED_OVERRIDES, &[0x40, 0x43]);
     for &op in ARB_INSTRUCTION_OVERRIDES {
         let bridged = COMPILED_HOST_BRIDGED_OVERRIDES.contains(&op);
         let ineligible = bytecode_ineligible(&[op, 0x00]).is_some();
@@ -739,12 +739,103 @@ fn compiled_caller_number_after_reverted_child() {
 }
 
 #[test]
-fn blockhash_still_rejected_at_compile() {
+fn blockhash_admitted_by_ring_bound_registry() {
     let mut registry = CompiledFrameRegistry::new(ArbSpecId::NITRO).expect("llvm");
     let blockhash_only = vec![0x60, 0x01, 0x40, 0x00];
     let number_then_blockhash = vec![0x43, 0x60, 0x01, 0x40, 0x00];
-    assert!(bytecode_ineligible(&blockhash_only).is_some());
-    assert!(bytecode_ineligible(&number_then_blockhash).is_some());
-    assert!(registry.compile(&blockhash_only).is_err());
-    assert!(registry.compile(&number_then_blockhash).is_err());
+    assert!(bytecode_ineligible(&blockhash_only).is_none());
+    assert!(bytecode_ineligible(&number_then_blockhash).is_none());
+    assert!(registry.compile(&blockhash_only).is_ok());
+    assert!(registry.compile(&number_then_blockhash).is_ok());
+}
+
+fn seed_l1_ring(db: &mut CacheDB<EmptyDB>) {
+    use arb_revm::{
+        constants::ARBOS_STATE_ADDRESS,
+        storage::{StorageSpace, Subspace},
+    };
+    let space = StorageSpace::arbos().open_subspace_with_key(Subspace::BlockHashes as u8);
+    for (key, value) in [
+        (0, U256::from(778)),
+        (1 + 777 % 256, U256::from(0x1234)),
+        (1 + 522 % 256, U256::from(0x5678)),
+    ] {
+        db.insert_account_storage(
+            ARBOS_STATE_ADDRESS,
+            U256::from_be_bytes(space.slot_for_u256(U256::from(key)).0),
+            value,
+        )
+        .unwrap();
+    }
+}
+
+fn ring_return_code(request: U256) -> Bytes {
+    let mut code = vec![0x7f];
+    code.extend_from_slice(&request.to_be_bytes::<32>());
+    // Repeat the lookup to exercise warm storage, then return the second hash.
+    code.extend_from_slice(&[
+        0x80, 0x40, 0x50, 0x40, 0x60, 0, 0x52, 0x60, 32, 0x60, 0, 0xf3,
+    ]);
+    code.into()
+}
+
+#[test]
+fn compiled_ring_boundaries_and_warm_reads_match_full_state() {
+    for (request, expected) in [
+        (U256::from(777), 0x1234),
+        (U256::from(522), 0x5678),
+        (U256::from(521), 0),
+        (U256::from(778), 0),
+        (U256::from(779), 0),
+        (U256::MAX, 0),
+        (U256::from(776), 0),
+    ] {
+        let code = ring_return_code(request);
+        let registry = warm_compile(ArbSpecId::NITRO, &[&code]);
+        let mut interpreted_db = CacheDB::new(EmptyDB::default());
+        seed_l1_ring(&mut interpreted_db);
+        insert_code(&mut interpreted_db, CONTRACT, code);
+        let mut compiled_db = interpreted_db.clone();
+        let interpreted = transact(&mut interpreted_db, unsigned_call(CONTRACT, 200_000), None);
+        let compiled = transact(
+            &mut compiled_db,
+            unsigned_call(CONTRACT, 200_000),
+            Some(registry.clone()),
+        );
+        assert!(interpreted.result.is_success(), "{interpreted:?}");
+        assert_eq!(interpreted.result.output(), Some(&word_u256(expected)));
+        assert_eq!(interpreted, compiled, "request {request}");
+        assert!(registry.dispatch_hits() > 0);
+        assert_eq!(
+            registry.identity().block_hash_semantics,
+            "arbos-l1-ring-blockhash-v1"
+        );
+    }
+}
+
+#[test]
+fn compiled_ring_nested_resume_matches_full_state() {
+    let callee = ring_return_code(U256::from(522));
+    let mut caller = call_callee_code(CALLEE).to_vec();
+    caller.truncate(caller.len() - 5); // after CALL, replace return with resumed ring lookup
+    caller.push(0x50); // discard CALL result
+    caller.extend_from_slice(&ring_return_code(U256::from(777)));
+    let caller = Bytes::from(caller);
+    let registry = warm_compile(ArbSpecId::NITRO, &[&caller, &callee]);
+    let mut db_i = CacheDB::new(EmptyDB::default());
+    seed_l1_ring(&mut db_i);
+    insert_code(&mut db_i, CONTRACT, caller.clone());
+    insert_code(&mut db_i, CALLEE, callee.clone());
+    let mut db_c = db_i.clone();
+    let interpreted = transact(&mut db_i, unsigned_call(CONTRACT, 200_000), None);
+    let compiled = transact(
+        &mut db_c,
+        unsigned_call(CONTRACT, 200_000),
+        Some(registry.clone()),
+    );
+    assert!(interpreted.result.is_success(), "{interpreted:?}");
+    assert_eq!(interpreted.result.output(), Some(&word_u256(0x1234)));
+    assert_eq!(interpreted, compiled);
+    assert!(registry.dispatch_hits_for(keccak256(&caller)) >= 2);
+    assert!(registry.dispatch_hits_for(keccak256(&callee)) >= 1);
 }
