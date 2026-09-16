@@ -681,6 +681,8 @@ where
                 evm.ctx_mut().journal_mut().checkpoint_commit();
                 return Ok(Some(filtered_tx_frame_result(evm.ctx().tx().gas_limit())));
             }
+            #[cfg(feature = "phase-timing")]
+            let _vm_phase = crate::phase_timing::PhaseGuard::enter(crate::phase_timing::Phase::Vm);
             return self.mainnet.execution(evm, checkpoint, gas);
         }
 
@@ -719,7 +721,12 @@ where
             }
             .into());
         }
-        let Some(mut frame_result) = self.mainnet.execution(evm, checkpoint, gas)? else {
+        let vm_result = {
+            #[cfg(feature = "phase-timing")]
+            let _vm_phase = crate::phase_timing::PhaseGuard::enter(crate::phase_timing::Phase::Vm);
+            self.mainnet.execution(evm, checkpoint, gas)?
+        };
+        let Some(mut frame_result) = vm_result else {
             return Ok(None);
         };
         // Return the withheld cap gas: it bounded compute but is not part of gasUsed.

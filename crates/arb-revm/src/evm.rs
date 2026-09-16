@@ -66,14 +66,30 @@ where
     Ok(())
 }
 
+// Keep all canonical table mutations here: the test snapshots ONE table before
+// calling this same helper, so codegen-unit function address duplication is irrelevant.
+fn install_arb_instruction_overrides<CTX>(instruction: &mut EthInstructions<EthInterpreter, CTX>)
+where
+    CTX: ContextTr<Chain = ArbChainContext> + Host,
+{
+    // Arbitrum overrides NUMBER (returns the L1 block number) and BLOCKHASH (returns the
+    // ArbOS-stored L1 block hash).
+    instruction.insert_instruction(opcode::NUMBER, Instruction::new(arb_block_number::<CTX>), 2);
+    instruction.insert_instruction(
+        opcode::BLOCKHASH,
+        Instruction::new(arb_block_hash::<CTX>),
+        20,
+    );
+}
+
 /// Opcodes whose instruction-table entries `ArbEvm::new` replaces.
 ///
 /// Compiled frames skip the instruction table. Each opcode here must be either
 /// refused by [`crate::compiled_frame::bytecode_ineligible`] or listed in
 /// [`COMPILED_HOST_BRIDGED_OVERRIDES`] and parity-tested on the compiled Host
 /// adapter. Kept next to the `insert_instruction` calls. Sorted numerically.
-/// The table-diff test in this file fails if `ArbEvm::new` grows another
-/// override without updating this list.
+/// The same-table mutation test and canonical-constructor source guard below
+/// detect new mutations that require review of this list.
 pub const ARB_INSTRUCTION_OVERRIDES: &[u8] = &[opcode::BLOCKHASH, opcode::NUMBER];
 
 /// Subset of [`ARB_INSTRUCTION_OVERRIDES`] that compiled frames may execute.
@@ -109,18 +125,7 @@ where
     pub fn new(ctx: CTX, inspector: INSP) -> Self {
         let spec: ArbSpecId = ctx.cfg().spec().into();
         let mut instruction = EthInstructions::new_mainnet_with_spec(spec.into());
-        // Arbitrum overrides NUMBER (returns the L1 block number) and BLOCKHASH (returns the
-        // ArbOS-stored L1 block hash).
-        instruction.insert_instruction(
-            opcode::NUMBER,
-            Instruction::new(arb_block_number::<CTX>),
-            2,
-        );
-        instruction.insert_instruction(
-            opcode::BLOCKHASH,
-            Instruction::new(arb_block_hash::<CTX>),
-            20,
-        );
+        install_arb_instruction_overrides(&mut instruction);
         debug_assert_eq!(
             ARB_INSTRUCTION_OVERRIDES,
             &[opcode::BLOCKHASH, opcode::NUMBER]
@@ -416,10 +421,12 @@ fn span_address(input: &FrameInput) -> Option<Address> {
 
 #[cfg(test)]
 mod instruction_table_diff {
-    use super::{ARB_INSTRUCTION_OVERRIDES, COMPILED_HOST_BRIDGED_OVERRIDES};
-    use crate::{ArbBuilder, ArbContext, ArbSpecId, DefaultArb};
+    use super::{
+        ARB_INSTRUCTION_OVERRIDES, COMPILED_HOST_BRIDGED_OVERRIDES,
+        install_arb_instruction_overrides,
+    };
+    use crate::{ArbContext, ArbSpecId};
     use revm::{
-        context::CfgEnv,
         database::{CacheDB, EmptyDB},
         handler::instructions::EthInstructions,
         interpreter::{Instruction, interpreter::EthInterpreter},
@@ -432,27 +439,57 @@ mod instruction_table_diff {
         unsafe { std::mem::transmute_copy(&inst) }
     }
 
+    // Mutation coverage below is meaningful only if the canonical constructor
+    // routes every table patch through the helper. Pin its complete reviewed body;
+    // intentional changes require reviewing both this snapshot and opcode parity.
+    // Whitespace changes alone are ignored. This is source drift detection, not
+    // a substitute for the interpreter/compiled NUMBER and BLOCKHASH parity tests.
+    fn canonical_constructor(source: &str) -> &str {
+        let start = source
+            .find("    pub fn new(ctx: CTX, inspector: INSP)")
+            .unwrap();
+        let tail = &source[start..];
+        let end = tail.find("    /// Consumes self").unwrap();
+        &tail[..end]
+    }
+    fn normalized(source: &str) -> String {
+        source.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+    #[test]
+    fn canonical_constructor_has_no_unreviewed_table_mutations() {
+        let actual = canonical_constructor(include_str!("evm.rs"));
+        let reviewed = include_str!("evm_canonical_constructor.reviewed.txt");
+        assert_eq!(
+            normalized(actual),
+            normalized(reviewed),
+            "canonical constructor changed: review all table mutations and compiled opcode parity before updating snapshot"
+        );
+        // Verify that a patch outside the shared helper cannot pass this guard.
+        let changed = actual.replace("install_arb_instruction_overrides(&mut instruction);",
+            "install_arb_instruction_overrides(&mut instruction); instruction.insert_instruction(opcode::ADD, Instruction::unknown(), 3);");
+        assert_ne!(normalized(&changed), normalized(reviewed));
+    }
+
     #[test]
     fn arb_overrides_are_exactly_number_and_blockhash() {
-        let mut db = CacheDB::new(EmptyDB::default());
-        let ctx = ArbContext::arb()
-            .with_db(&mut db)
-            .with_cfg(CfgEnv::new_with_spec(ArbSpecId::NITRO));
-        let evm = ctx.build_arb();
-        let spec = ArbSpecId::NITRO.into_eth_spec();
         type Host<'a> = ArbContext<&'a mut CacheDB<EmptyDB>>;
-        let baseline = EthInstructions::<EthInterpreter, Host<'_>>::new_mainnet_with_spec(spec);
-
-        let arb_ins = evm.0.instruction.instruction_table();
-        let base_ins = baseline.instruction_table();
-        let arb_gas = evm.0.instruction.gas_table();
-        let base_gas = baseline.gas_table();
+        let mut table = EthInstructions::<EthInterpreter, Host<'_>>::new_mainnet_with_spec(
+            ArbSpecId::NITRO.into_eth_spec(),
+        );
+        // Snapshot values from this exact table, not a second initializer: Rust can
+        // instantiate the same function at different addresses across codegen units.
+        let before = table.instruction_table().map(instruction_fn_addr);
+        let before_gas = *table.gas_table();
+        install_arb_instruction_overrides(&mut table);
+        let after = table.instruction_table().map(instruction_fn_addr);
+        let after_gas = table.gas_table();
+        assert_eq!(after_gas[revm::bytecode::opcode::NUMBER as usize], 2);
+        assert_eq!(after_gas[revm::bytecode::opcode::BLOCKHASH as usize], 20);
 
         let mut diffs = Vec::new();
         for op in 0u8..=255 {
-            let fn_diff = instruction_fn_addr(arb_ins[op as usize])
-                != instruction_fn_addr(base_ins[op as usize]);
-            let gas_diff = arb_gas[op as usize] != base_gas[op as usize];
+            let fn_diff = before[op as usize] != after[op as usize];
+            let gas_diff = before_gas[op as usize] != after_gas[op as usize];
             if fn_diff || gas_diff {
                 diffs.push(op);
             }
