@@ -263,7 +263,7 @@ mod tests {
         ] {
             let mut ctx: ArbContext<EmptyDB> = ArbContext::arb();
             ctx.block.number = U256::from(1000);
-            let hashes = ArbosState::open().block_hashes;
+            let hashes = &ArbosState::open().block_hashes;
             hashes.set_l1_block_number(778, ctx.journal_mut()).unwrap();
             hashes
                 .set_block_hash(777, B256::repeat_byte(0x42), ctx.journal_mut())
