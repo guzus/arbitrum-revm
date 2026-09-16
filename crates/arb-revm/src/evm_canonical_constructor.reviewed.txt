@@ -1,0 +1,25 @@
+pub fn new(ctx: CTX, inspector: INSP) -> Self {
+        let spec: ArbSpecId = ctx.cfg().spec().into();
+        let mut instruction = EthInstructions::new_mainnet_with_spec(spec.into());
+        install_arb_instruction_overrides(&mut instruction);
+        debug_assert_eq!(
+            ARB_INSTRUCTION_OVERRIDES,
+            &[opcode::BLOCKHASH, opcode::NUMBER]
+        );
+        debug_assert_eq!(
+            COMPILED_HOST_BRIDGED_OVERRIDES,
+            &[opcode::BLOCKHASH, opcode::NUMBER]
+        );
+        debug_assert!(
+            COMPILED_HOST_BRIDGED_OVERRIDES
+                .iter()
+                .all(|op| ARB_INSTRUCTION_OVERRIDES.contains(op))
+        );
+        Self::from_inner(Evm {
+            ctx,
+            inspector,
+            instruction,
+            precompiles: ArbPrecompiles::new_with_spec(spec),
+            frame_stack: FrameStack::new_prealloc(8),
+        })
+    }
