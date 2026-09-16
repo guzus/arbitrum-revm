@@ -1,12 +1,12 @@
 //! Ownership-safe compiler artifact. The LLVM module outlives every function pointer.
 
-use super::eligibility::{IneligibleReason, bytecode_ineligible};
+use super::eligibility::{IneligibleReason, bytecode_ineligible_with_ring};
 use crate::ArbSpecId;
 use revm::{
     context_interface::cfg::GasParams,
     primitives::{B256, keccak256},
 };
-use revmc::{CompileTimings, EvmCompiler, EvmCompilerFn};
+use revmc::{BlockHashSemantics, CompileTimings, EvmCompiler, EvmCompilerFn, EvmLlvmBackend};
 use std::{
     collections::HashMap,
     fmt,
@@ -18,8 +18,7 @@ use std::{
 /// Lookup also requires the live frame's `ArbSpecId` and `GasParams` to match the
 /// values this instance compiled against. That is the cache key: code hash plus this
 /// immutable instance context (ArbOS spec, eth spec, target, compiler, runtime, gas).
-pub const COMPILER_IDENTITY: &str =
-    "revmc-llvm/in-process-owned-jit/gas-metered/single-error-off/stack-checks-on";
+pub const COMPILER_IDENTITY: &str = "revmc-6f8854dc/arbos-l1-ring-blockhash-v1/in-process-owned-jit/gas-metered/single-error-off/stack-checks-on";
 
 /// Failure from constructing a registry or compiling a program.
 #[derive(Debug)]
@@ -54,7 +53,9 @@ pub struct CompiledFrameIdentity {
     pub target_arch: &'static str,
     /// Host OS compiled for.
     pub target_os: &'static str,
-    /// Compiler / runtime / gas-check identity. See [`COMPILER_IDENTITY`].
+    /// Immutable compiler/host BLOCKHASH contract; part of the cache identity.
+    pub block_hash_semantics: &'static str,
+    /// Compiler/runtime build identity. See [`COMPILER_IDENTITY`].
     pub compiler_runtime: &'static str,
 }
 
@@ -97,8 +98,10 @@ impl CompiledFrameRegistry {
     pub fn new(spec: ArbSpecId) -> Result<Self, CompiledFrameError> {
         let eth_spec = spec.into_eth_spec();
         let gas_params = GasParams::new_spec(eth_spec);
-        let mut compiler = EvmCompiler::new_llvm(false)
+        let backend = EvmLlvmBackend::new(false)
             .map_err(|err| CompiledFrameError::Compiler(err.to_string()))?;
+        let mut compiler =
+            EvmCompiler::new_with_block_hash_semantics(backend, BlockHashSemantics::ArbosL1Ring);
         compiler.set_module_name("arb-compiled-frame");
         compiler.set_dump_to(None);
         compiler.dump_assembly(false);
@@ -119,6 +122,7 @@ impl CompiledFrameRegistry {
                 target_arch: std::env::consts::ARCH,
                 target_os: std::env::consts::OS,
                 compiler_runtime: COMPILER_IDENTITY,
+                block_hash_semantics: BlockHashSemantics::ArbosL1Ring.cache_tag(),
             },
             gas_params,
             last_timings: None,
@@ -137,7 +141,14 @@ impl CompiledFrameRegistry {
 
     /// True when a live frame's spec and gas table match this instance.
     pub fn accepts_context(&self, spec: ArbSpecId, gas_params: &GasParams) -> bool {
-        spec == self.identity.spec && gas_params == &self.gas_params
+        self.has_arbos_ring_semantics()
+            && spec == self.identity.spec
+            && gas_params == &self.gas_params
+    }
+
+    fn has_arbos_ring_semantics(&self) -> bool {
+        self.compiler.block_hash_semantics() == BlockHashSemantics::ArbosL1Ring
+            && self.identity.block_hash_semantics == BlockHashSemantics::ArbosL1Ring.cache_tag()
     }
 
     /// Whether `code_hash` has a compiled function in this instance.
@@ -166,7 +177,9 @@ impl CompiledFrameRegistry {
     /// Returns the keccak-256 code hash used as the lookup key. Already-compiled
     /// hashes are no-ops. Never call this from `frame_run`.
     pub fn compile(&mut self, bytecode: &[u8]) -> Result<B256, CompiledFrameError> {
-        if let Some(reason) = bytecode_ineligible(bytecode) {
+        if let Some(reason) =
+            bytecode_ineligible_with_ring(bytecode, self.has_arbos_ring_semantics())
+        {
             return Err(CompiledFrameError::Ineligible(reason));
         }
         let code_hash = keccak256(bytecode);
@@ -218,6 +231,9 @@ impl CompiledFrameRegistry {
 
     /// Looks up a compiled function. Pointers are valid only while `self` is alive.
     pub(crate) fn lookup(&self, code_hash: B256, live_len: usize) -> Option<EvmCompilerFn> {
+        if !self.has_arbos_ring_semantics() {
+            return None;
+        }
         let program = self.programs.get(&code_hash)?;
         if program.code_len != live_len {
             return None;

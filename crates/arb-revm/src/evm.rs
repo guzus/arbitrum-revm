@@ -78,14 +78,10 @@ pub const ARB_INSTRUCTION_OVERRIDES: &[u8] = &[opcode::BLOCKHASH, opcode::NUMBER
 
 /// Subset of [`ARB_INSTRUCTION_OVERRIDES`] that compiled frames may execute.
 ///
-/// NUMBER is bridged: revmc `__revmc_builtin_number` calls `Host::block_number()`,
-/// and the compiled-only adapter returns `chain().l1_block_number` without
-/// writing `BlockEnv`. BLOCKHASH is **not** listed. Its builtin subtracts the
-/// requested number from `Host::block_number()` and, for a 256-block L2 window,
-/// calls `Host::block_hash` (header DB). That is not the ArbOS L1 ring used by
-/// `arb_block_hash`. Do not add an opcode here without a compiled-vs-interpreter
-/// parity test; unclassified overrides stay refused.
-pub const COMPILED_HOST_BRIDGED_OVERRIDES: &[u8] = &[opcode::NUMBER];
+/// NUMBER uses the compiled-only L1-number adapter. BLOCKHASH requires the
+/// registry's immutable ArbOS-ring compiler mode and journal-backed adapter.
+/// The Ethereum compiler remains unchanged; only this owned registry admits it.
+pub const COMPILED_HOST_BRIDGED_OVERRIDES: &[u8] = &[opcode::BLOCKHASH, opcode::NUMBER];
 
 /// Arbitrum EVM wrapper over revm's generic [`Evm`] type.
 ///
@@ -129,7 +125,10 @@ where
             ARB_INSTRUCTION_OVERRIDES,
             &[opcode::BLOCKHASH, opcode::NUMBER]
         );
-        debug_assert_eq!(COMPILED_HOST_BRIDGED_OVERRIDES, &[opcode::NUMBER]);
+        debug_assert_eq!(
+            COMPILED_HOST_BRIDGED_OVERRIDES,
+            &[opcode::BLOCKHASH, opcode::NUMBER]
+        );
         debug_assert!(
             COMPILED_HOST_BRIDGED_OVERRIDES
                 .iter()
@@ -471,7 +470,10 @@ mod instruction_table_diff {
         );
         assert_eq!(
             COMPILED_HOST_BRIDGED_OVERRIDES,
-            &[revm::bytecode::opcode::NUMBER],
+            &[
+                revm::bytecode::opcode::BLOCKHASH,
+                revm::bytecode::opcode::NUMBER
+            ],
             "new table overrides must be refused or given an explicit compiled-host parity test; do not expand this allowlist silently"
         );
     }

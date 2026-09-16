@@ -1,5 +1,43 @@
 # Compiled-frame proof of concept
 
+## Current BLOCKHASH experiment (2026-09-16)
+
+The `compiled-frame` feature remains off by default. The owned registry now pins
+both `revmc` and `revmc-build` to `guzus/revmc` commit
+`6f8854dc7e5265f238ada30e16ea8629bafd95d7`. Its only constructor selects immutable
+`BlockHashSemantics::ArbosL1Ring`; public eligibility therefore admits BLOCKHASH.
+The ordinary Ethereum compiler default is unchanged.
+
+The compiled host reads `ArbosState::block_hashes` through the live journal,
+matching the interpreter's storage warmth, range checks and error-to-zero policy.
+The builtin saturates the U256 request to u64 before this lookup. NUMBER still
+returns the supplied L1 number; neither method rewrites the L2 block environment.
+The forwarding-only host constructor remains private and is never used by dispatch.
+
+Registry identity includes `arbos-l1-ring-blockhash-v1` and the compiler pin;
+context acceptance and function lookup require that semantic binding. Registry
+entries cannot be imported from an external cache or another compiler owner.
+Any future external object cache must include this tag and the complete build,
+specification, target and gas configuration identity.
+
+Added qualification tests cover generated Ethereum/ArbOS symbol coexistence in one
+process, cursor distinct from NUMBER, current/future/window boundary/MAX/missing
+hashes, repeated warm reads, journal read failure, nested calls and resumed parent
+frames. Transaction comparisons include the entire execution result and state.
+These tests still require Linux/LLVM execution; source formatting is not parity
+qualification and no speedup or deployment is claimed.
+
+```sh
+cargo test -p arb-revm --features compiled-frame --lib compiled_frame
+cargo test -p arb-revm --features compiled-frame --test compiled_frame
+```
+
+## Historical NUMBER-only prototype notes
+
+The remainder records the earlier 79e3c8ca prototype, including its historical
+BLOCKHASH refusal. The current semantic binding above supersedes that refusal.
+
+
 Isolated, **default-off** research path. It does not replace `ArbHandler`, ArbOS
 precompiles, poster fees, retryables, or frame init/return/span accounting. It
 does not wrap the EVM in upstream `JitEvm` (those entrypoints use

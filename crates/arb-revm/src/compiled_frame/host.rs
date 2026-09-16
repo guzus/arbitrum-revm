@@ -11,13 +11,12 @@
 //! `load_account_code_hash`), is forwarded to the original host so an inner
 //! override is not replaced by the trait default.
 //!
-//! BLOCKHASH is not bridged. `__revmc_builtin_blockhash` subtracts the requested
-//! number from `Host::block_number()` and accepts only `(0, 256]` then calls
-//! `Host::block_hash` (L2 DB). ArbOS `arb_block_hash` reads the L1 ring with a
-//! different range (`>= current || current > number+256`). Do not conflate them.
+//! The ArbOS constructor also routes BLOCKHASH directly to the journal-backed
+//! L1 ring. It must be paired with the explicit ArbOS compiler semantic mode.
 
 use revm::{
     context_interface::{
+        ContextTr,
         cfg::GasParams,
         context::{SStoreResult, SelfDestructResult, StateLoad},
         host::LoadError,
@@ -31,6 +30,7 @@ use revm::{
 pub(crate) struct CompiledNumberHost<'a, H: Host + ?Sized> {
     inner: &'a mut H,
     l1_block_number: U256,
+    block_hash_lookup: fn(&mut H, u64) -> Option<B256>,
 }
 
 impl<'a, H: Host + ?Sized> CompiledNumberHost<'a, H> {
@@ -38,6 +38,24 @@ impl<'a, H: Host + ?Sized> CompiledNumberHost<'a, H> {
         Self {
             inner,
             l1_block_number: U256::from(l1_block_number),
+            block_hash_lookup: H::block_hash,
+        }
+    }
+}
+
+impl<'a, H: Host + ContextTr> CompiledNumberHost<'a, H> {
+    pub(crate) fn new_arb_ring(inner: &'a mut H, l1_block_number: u64) -> Self {
+        Self {
+            inner,
+            l1_block_number: U256::from(l1_block_number),
+            block_hash_lookup: |host, number| {
+                Some(
+                    crate::storage::ArbosState::open()
+                        .block_hashes
+                        .block_hash(number, host.journal_mut())
+                        .unwrap_or(B256::ZERO),
+                )
+            },
         }
     }
 }
@@ -109,7 +127,7 @@ impl<H: Host + ?Sized> Host for CompiledNumberHost<'_, H> {
     }
 
     fn block_hash(&mut self, number: u64) -> Option<B256> {
-        self.inner.block_hash(number)
+        (self.block_hash_lookup)(self.inner, number)
     }
 
     fn selfdestruct(
@@ -208,6 +226,101 @@ mod tests {
         interpreter::Host,
         primitives::{Address, B256, Log, StorageKey, StorageValue, U256, hardfork::SpecId},
     };
+
+    #[test]
+    fn generated_ethereum_and_ring_symbols_coexist() {
+        use crate::{ArbContext, ArbSpecId, DefaultArb, storage::ArbosState};
+        use revm::{
+            context_interface::ContextTr,
+            database::EmptyDB,
+            interpreter::{
+                InputsImpl, Interpreter, InterpreterAction, SharedMemory, interpreter::ExtBytecode,
+            },
+            primitives::Bytes,
+            state::Bytecode,
+        };
+        use revmc::{BlockHashSemantics, EvmCompiler, EvmLlvmBackend};
+        let spec = ArbSpecId::NITRO.into_eth_spec();
+        let mut eth = EvmCompiler::new_llvm(false).unwrap();
+        let mut arb = EvmCompiler::new_with_block_hash_semantics(
+            EvmLlvmBackend::new(false).unwrap(),
+            BlockHashSemantics::ArbosL1Ring,
+        );
+        assert_eq!(eth.block_hash_semantics(), BlockHashSemantics::Ethereum);
+        let code = [
+            0x61, 0x03, 0x09, 0x40, 0x60, 0, 0x52, 0x60, 32, 0x60, 0, 0xf3,
+        ];
+        // SAFETY: both compiler owners remain live through every call below.
+        let eth_fn = unsafe { eth.jit("ethereum_ring_coexist", &code, spec) }.unwrap();
+        let arb_fn = unsafe { arb.jit("arbos_ring_coexist", &code, spec) }.unwrap();
+        arb.clear_ir().unwrap();
+        assert_eq!(arb.block_hash_semantics(), BlockHashSemantics::ArbosL1Ring);
+        for (func, expected) in [
+            (eth_fn, B256::ZERO),
+            (arb_fn, B256::repeat_byte(0x42)),
+            (eth_fn, B256::ZERO),
+            (arb_fn, B256::repeat_byte(0x42)),
+        ] {
+            let mut ctx: ArbContext<EmptyDB> = ArbContext::arb();
+            ctx.block.number = U256::from(1000);
+            let hashes = ArbosState::open().block_hashes;
+            hashes.set_l1_block_number(778, ctx.journal_mut()).unwrap();
+            hashes
+                .set_block_hash(777, B256::repeat_byte(0x42), ctx.journal_mut())
+                .unwrap();
+            let mut interpreter = Interpreter::new(
+                SharedMemory::new(),
+                ExtBytecode::new(Bytecode::new_raw(Bytes::copy_from_slice(&code))),
+                InputsImpl::default(),
+                false,
+                spec,
+                100_000,
+            );
+            let mut host = CompiledNumberHost::new_arb_ring(&mut ctx, 777);
+            // SAFETY: valid interpreter/host and the matching compiler owners are alive.
+            let action = unsafe { func.call_with_interpreter(&mut interpreter, &mut host) };
+            let InterpreterAction::Return(result) = action else {
+                panic!("unexpected {action:?}")
+            };
+            assert_eq!(result.output.as_ref(), expected.as_slice());
+            assert_eq!(ctx.block.number, U256::from(1000));
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadFailure;
+    impl std::fmt::Display for ReadFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("test read failure")
+        }
+    }
+    impl std::error::Error for ReadFailure {}
+    impl revm::database_interface::DBErrorMarker for ReadFailure {}
+    struct FailingDb;
+    impl revm::Database for FailingDb {
+        type Error = ReadFailure;
+        fn basic(&mut self, _: Address) -> Result<Option<revm::state::AccountInfo>, ReadFailure> {
+            Err(ReadFailure)
+        }
+        fn code_by_hash(&mut self, _: B256) -> Result<revm::state::Bytecode, ReadFailure> {
+            Err(ReadFailure)
+        }
+        fn storage(&mut self, _: Address, _: U256) -> Result<U256, ReadFailure> {
+            Err(ReadFailure)
+        }
+        fn block_hash(&mut self, _: u64) -> Result<B256, ReadFailure> {
+            panic!("must not call L2 database block_hash")
+        }
+    }
+
+    #[test]
+    fn ring_adapter_maps_journal_failure_to_some_zero() {
+        use crate::{ArbContext, DefaultArb};
+        let mut ctx = ArbContext::arb().with_db(FailingDb);
+        let mut host = CompiledNumberHost::new_arb_ring(&mut ctx, 777);
+        assert_eq!(host.block_hash(777), Some(B256::ZERO));
+        assert_eq!(host.block_hash(u64::MAX), Some(B256::ZERO));
+    }
 
     /// Inner Host that overrides defaulted `sstore` so forwarding is observable.
     struct CountingHost {
