@@ -13,6 +13,9 @@
 // brotli source and avoid a lockfile collision. BUSL-licensed; see the NOTICE.
 pub use brotli;
 
+#[cfg(feature = "phase-timing")]
+pub mod phase_timing;
+
 pub mod api;
 pub mod arb_journal;
 pub mod arbos_init;

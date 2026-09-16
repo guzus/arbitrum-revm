@@ -79,10 +79,36 @@ where
     fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
         self.0.ctx.set_tx(tx);
         let mut h = ArbHandler::<_, _, EthFrame<EthInterpreter>>::new();
+        #[cfg(feature = "phase-timing")]
+        if crate::phase_timing::active_attempt() {
+            return crate::phase_timing::run(&mut h, self);
+        }
         h.run(self)
     }
 
+    // Same order as ExecuteEvm::transact in revm-handler 42.0.1: finalize even
+    // when transact_one returns Err. The attempt guard spans both operations.
+    #[cfg(feature = "phase-timing")]
+    fn transact(
+        &mut self,
+        tx: Self::Tx,
+    ) -> Result<ExecResultAndState<Self::ExecutionResult, Self::State>, Self::Error> {
+        use revm::context_interface::Transaction;
+        let attempt = crate::phase_timing::AttemptGuard::begin(
+            crate::phase_timing::Entry::Transact,
+            tx.tx_type(),
+            tx.nonce(),
+        );
+        let result = self.transact_one(tx);
+        attempt.outcome(&result);
+        let state = self.finalize();
+        let result = result?;
+        Ok(ExecResultAndState::new(result, state))
+    }
+
     fn finalize(&mut self) -> Self::State {
+        #[cfg(feature = "phase-timing")]
+        let _phase = crate::phase_timing::PhaseGuard::enter(crate::phase_timing::Phase::Finalize);
         self.0.ctx.journal_mut().finalize()
     }
 
@@ -90,7 +116,27 @@ where
         &mut self,
     ) -> Result<ExecResultAndState<Self::ExecutionResult, Self::State>, Self::Error> {
         let mut h = ArbHandler::<_, _, EthFrame<EthInterpreter>>::new();
-        h.run(self).map(|result| {
+        #[cfg(feature = "phase-timing")]
+        let attempt = {
+            use revm::context_interface::Transaction;
+            crate::phase_timing::AttemptGuard::begin(
+                crate::phase_timing::Entry::Replay,
+                self.0.ctx.tx().tx_type(),
+                self.0.ctx.tx().nonce(),
+            )
+        };
+        #[cfg(feature = "phase-timing")]
+        let result = if crate::phase_timing::active_attempt() {
+            crate::phase_timing::run(&mut h, self)
+        } else {
+            h.run(self)
+        };
+        #[cfg(not(feature = "phase-timing"))]
+        let result = h.run(self);
+        #[cfg(feature = "phase-timing")]
+        attempt.outcome(&result);
+        // Preserve replay's existing success-only finalize, unlike transact.
+        result.map(|result| {
             let state = self.finalize();
             ExecResultAndState::new(result, state)
         })

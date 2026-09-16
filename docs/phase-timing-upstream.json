@@ -1,0 +1,9 @@
+{
+  "package": "revm-handler",
+  "version": "42.0.1",
+  "method_sha256": {
+    "handler.rs:run": "3d78a73e657580d6f023745a8bd531747d93c772ca233c722d6145978faef074",
+    "handler.rs:run_without_catch_error": "1c1750a6f2e02999a12217c5db34bccd6415c17c8f54971baf93b452c94b98cc",
+    "api.rs:transact": "91618e9a4f17a0d24eead40c7f55d06b1b94f5df71cd711c7345b133b9666c45"
+  }
+}
