@@ -57,6 +57,8 @@ pub struct CompiledFrameIdentity {
     pub block_hash_semantics: &'static str,
     /// Compiler/runtime build identity. See [`COMPILER_IDENTITY`].
     pub compiler_runtime: &'static str,
+    /// Requested simple perf map mode, not proof of map availability.
+    pub simple_perf_requested: bool,
 }
 
 struct CompiledProgram {
@@ -96,6 +98,20 @@ impl CompiledFrameRegistry {
     /// Gas metering stays on. `single_error` is turned **off** so halt reasons are
     /// not collapsed to `OutOfGas`.
     pub fn new(spec: ArbSpecId) -> Result<Self, CompiledFrameError> {
+        Self::new_configured(spec, false)
+    }
+
+    /// Diagnostic-only constructor requesting `/tmp/perf-<pid>.map` JIT symbols.
+    ///
+    /// Must run in a fresh process before any other JIT compilation: LLVM's
+    /// process-global first compilation selects this setting. Plugin failures
+    /// are warnings upstream, so callers must verify the actual map and symbols.
+    /// This request does not establish profiling success or sample quality.
+    pub fn new_with_simple_perf(spec: ArbSpecId) -> Result<Self, CompiledFrameError> {
+        Self::new_configured(spec, true)
+    }
+
+    fn new_configured(spec: ArbSpecId, simple_perf: bool) -> Result<Self, CompiledFrameError> {
         let eth_spec = spec.into_eth_spec();
         let gas_params = GasParams::new_spec(eth_spec);
         let backend = EvmLlvmBackend::new(false)
@@ -106,7 +122,7 @@ impl CompiledFrameRegistry {
         compiler.set_dump_to(None);
         compiler.dump_assembly(false);
         compiler.set_debug_support(false);
-        compiler.set_simple_perf(false);
+        compiler.set_simple_perf(simple_perf);
         compiler.gas_metering(true);
         compiler.single_error(false);
         // SAFETY: `true` is the revmc default; set explicitly so COMPILER_IDENTITY
@@ -122,6 +138,7 @@ impl CompiledFrameRegistry {
                 target_arch: std::env::consts::ARCH,
                 target_os: std::env::consts::OS,
                 compiler_runtime: COMPILER_IDENTITY,
+                simple_perf_requested: simple_perf,
                 block_hash_semantics: BlockHashSemantics::ArbosL1Ring.cache_tag(),
             },
             gas_params,
@@ -240,5 +257,28 @@ impl CompiledFrameRegistry {
         }
         program.hits.fetch_add(1, Ordering::Relaxed);
         Some(program.func)
+    }
+}
+
+#[cfg(test)]
+mod profile_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn simple_perf_is_explicit_and_bound_before_compilation() {
+        let ordinary = CompiledFrameRegistry::new(ArbSpecId::NITRO).unwrap();
+        let diagnostic = CompiledFrameRegistry::new_with_simple_perf(ArbSpecId::NITRO).unwrap();
+        let ordinary_after = CompiledFrameRegistry::new(ArbSpecId::NITRO).unwrap();
+        for registry in [&ordinary, &ordinary_after] {
+            assert!(!registry.compiler.simple_perf());
+            assert!(!registry.identity().simple_perf_requested);
+            assert!(registry.is_empty());
+            assert!(registry.has_arbos_ring_semantics());
+        }
+        assert!(diagnostic.compiler.simple_perf());
+        assert!(diagnostic.identity().simple_perf_requested);
+        assert!(diagnostic.is_empty());
+        assert!(diagnostic.has_arbos_ring_semantics());
+        // No JIT here: this proves request plumbing, not process-global map setup.
     }
 }
