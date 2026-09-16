@@ -16,12 +16,15 @@ pub enum StackDispatchMode {
     #[default]
     Indirect,
     Direct,
+    /// Same kernel without per-opcode counting; direct_steps is unavailable (stored as zero).
+    DirectUncounted,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StackDispatchStats {
     pub direct_frames: u64,
     /// Hot opcode calls after static gas was charged, including calls returning errors.
+    /// Always zero in DirectUncounted: unavailable, not evidence of no direct execution.
     pub direct_steps: u64,
 }
 
@@ -88,12 +91,21 @@ pub(crate) fn run_frame<CTX: Host>(
             host,
         );
     }
-    let (action, hits) = run_direct(
-        interpreter,
-        instructions.instruction_table(),
-        instructions.gas_table(),
-        host,
-    );
+    let (action, hits) = match instructions.mode {
+        StackDispatchMode::Direct => run_direct::<true, _>(
+            interpreter,
+            instructions.instruction_table(),
+            instructions.gas_table(),
+            host,
+        ),
+        StackDispatchMode::DirectUncounted => run_direct::<false, _>(
+            interpreter,
+            instructions.instruction_table(),
+            instructions.gas_table(),
+            host,
+        ),
+        StackDispatchMode::Indirect => unreachable!("indirect mode returned above"),
+    };
     instructions.stats.direct_frames += 1;
     instructions.stats.direct_steps += hits;
     action
@@ -101,7 +113,7 @@ pub(crate) fn run_frame<CTX: Host>(
 
 // Matches upstream Interpreter::step/run_plain ordering exactly. Only selected
 // canonical stack functions become direct calls; all other slots keep the Arb table.
-fn run_direct<CTX: Host>(
+fn run_direct<const COUNT: bool, CTX: Host>(
     interpreter: &mut Interpreter,
     table: &InstructionTable<EthInterpreter, CTX>,
     gas: &GasTable,
@@ -118,35 +130,51 @@ fn run_direct<CTX: Host>(
         let ctx = InstructionContext { interpreter, host };
         let result = match op {
             0x50 => {
-                hits += 1;
+                if COUNT {
+                    hits += 1;
+                }
                 stack::pop(ctx)
             }
             0x60 => {
-                hits += 1;
+                if COUNT {
+                    hits += 1;
+                }
                 stack::push::<1, _, _>(ctx)
             }
             0x61 => {
-                hits += 1;
+                if COUNT {
+                    hits += 1;
+                }
                 stack::push::<2, _, _>(ctx)
             }
             0x80 => {
-                hits += 1;
+                if COUNT {
+                    hits += 1;
+                }
                 stack::dup::<1, _, _>(ctx)
             }
             0x81 => {
-                hits += 1;
+                if COUNT {
+                    hits += 1;
+                }
                 stack::dup::<2, _, _>(ctx)
             }
             0x82 => {
-                hits += 1;
+                if COUNT {
+                    hits += 1;
+                }
                 stack::dup::<3, _, _>(ctx)
             }
             0x90 => {
-                hits += 1;
+                if COUNT {
+                    hits += 1;
+                }
                 stack::swap::<1, _, _>(ctx)
             }
             0x91 => {
-                hits += 1;
+                if COUNT {
+                    hits += 1;
+                }
                 stack::swap::<2, _, _>(ctx)
             }
             _ => table[op as usize].execute(ctx),
@@ -196,7 +224,16 @@ mod tests {
         let mut baseline = interpreter(code, gas, stack);
         let mut direct = interpreter(code, gas, stack);
         let expected = baseline.run_plain(&table, &costs, &mut DummyHost::default());
-        let (actual, _) = run_direct(&mut direct, &table, &costs, &mut DummyHost::default());
+        let (actual, _) =
+            run_direct::<true, _>(&mut direct, &table, &costs, &mut DummyHost::default());
+        let mut uncounted = interpreter(code, gas, stack);
+        let (without_counts, hits) =
+            run_direct::<false, _>(&mut uncounted, &table, &costs, &mut DummyHost::default());
+        assert_eq!(without_counts, actual);
+        assert_eq!(hits, 0);
+        assert_eq!(uncounted.stack.data(), direct.stack.data());
+        assert_eq!(uncounted.bytecode.pc(), direct.bytecode.pc());
+        assert_eq!(uncounted.gas, direct.gas);
         assert_eq!(actual, expected, "code={code:x?} gas={gas}");
         assert_eq!(direct.stack.data(), baseline.stack.data());
         assert_eq!(direct.bytecode.pc(), baseline.bytecode.pc());
@@ -294,6 +331,21 @@ mod tests {
         let actual = direct.transact(tx()).unwrap();
         assert!(actual.result.is_success(), "{actual:?}");
         assert_eq!(actual, expected);
+        let mut uncounted = CanonicalArbEvm::new_canonical(
+            context!(db(&parent, Some(&child))),
+            (),
+            StackDispatchMode::DirectUncounted,
+        );
+        assert_eq!(uncounted.transact(tx()).unwrap(), actual);
+        assert_eq!(
+            uncounted.0.instruction.mode(),
+            StackDispatchMode::DirectUncounted
+        );
+        assert_eq!(uncounted.0.instruction.stats().direct_steps, 0);
+        assert_eq!(
+            uncounted.0.instruction.stats().direct_frames,
+            direct.0.instruction.stats().direct_frames
+        );
         assert_eq!(
             baseline.0.instruction.stats(),
             StackDispatchStats::default()
@@ -320,6 +372,17 @@ mod tests {
             inspected.0.instruction.stats(),
             StackDispatchStats::default()
         );
+        let mut uncounted = CanonicalArbEvm::new_canonical(
+            context!(db(&code, None)),
+            NoOpInspector {},
+            StackDispatchMode::DirectUncounted,
+        );
+        assert!(uncounted.inspect_tx(tx()).unwrap().result.is_success());
+        assert_eq!(
+            uncounted.0.instruction.stats(),
+            StackDispatchStats::default()
+        );
+
         let canonical = CanonicalArbEvm::new_canonical(
             context!(db(&code, None)),
             (),

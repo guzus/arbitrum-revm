@@ -39,3 +39,18 @@ bounds, mixed direct/indirect code, nested call and parent resume, full EVM
 result/state parity, custom opcode override retention, and inspector/from_inner
 bypass. Full witness qualification and Stylus/compiled feature builds remain
 separate required integration checks.
+
+## Counter ablation
+
+`StackDispatchMode::DirectUncounted` runs the same guarded eight-opcode kernel as
+`Direct`, instantiated with a compile-time `COUNT = false`. Only per-opcode hit
+increments are removed; PC, gas, opcode calls, errors and frame-level aggregation
+retain the same path. `direct_frames` must remain positive for an executed kernel.
+`direct_steps == 0` means unavailable in this mode, not unused; consumers must
+report it as null alongside the explicit mode. The kernel still returns a zero
+hit value, preserving the shared implementation and result structure.
+
+The counter-ablation comparison is limited to same-binary indirect/counted/uncounted
+runs with full parity. It does not relax the deployment threshold or make counts
+into timings. Differential edge cases and nested full-result/state tests compare
+both direct variants against the same indirect reference.
