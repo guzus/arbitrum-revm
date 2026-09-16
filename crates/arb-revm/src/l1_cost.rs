@@ -413,16 +413,17 @@ mod tests {
     #[test]
     fn shared_canonical_bytes_retain_storage_and_survive_tx_replacement() {
         let encoded = Bytes::from(vec![0x42; 512]);
-        let mut tx = ArbTransaction::new(TxEnv::default()).with_encoded_2718(encoded.clone());
+        let original_ptr = encoded.as_ptr();
+        let mut tx = ArbTransaction::new(TxEnv::default()).with_encoded_2718(encoded);
         let shared = poster_tx_bytes(&tx);
-        assert_eq!(shared.as_ptr(), encoded.as_ptr());
+        assert_eq!(shared.as_ptr(), original_ptr);
         assert_eq!(shared.as_ref(), encode_tx_bytes(&tx));
         tx.encoded_2718 = Some(Bytes::from(vec![0x99; 513]));
         let replacement = poster_tx_bytes(&tx);
         assert_eq!(replacement.as_ref(), encode_tx_bytes(&tx));
         assert_ne!(replacement.as_ptr(), shared.as_ptr());
         drop(tx);
-        assert_eq!(shared, encoded);
+        assert_eq!(shared.as_ref(), &[0x42; 512]);
     }
 
     #[test]
