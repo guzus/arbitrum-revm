@@ -132,6 +132,13 @@ pub trait ArbTxTr: Transaction {
         None
     }
 
+    /// Optional shared ownership of the same canonical bytes returned by
+    /// `encoded_2718_bytes`. Implementations must return identical bytes, never a
+    /// cached encoding of a different transaction. Default preserves custom implementations.
+    fn encoded_2718_shared(&self) -> Option<Bytes> {
+        None
+    }
+
     /// Returns canonical EIP-2718 transaction bytes when available.
     fn encoded_2718_bytes(&self) -> Option<&[u8]> {
         None
@@ -238,6 +245,10 @@ impl<TX: Transaction + SystemCallTx> SystemCallTx for ArbTransaction<TX> {
 }
 
 impl<T: Transaction> ArbTxTr for ArbTransaction<T> {
+    fn encoded_2718_shared(&self) -> Option<Bytes> {
+        self.encoded_2718.clone()
+    }
+
     fn prepared_poster_compression(&self) -> Option<&Arc<PreparedPosterCompression>> {
         self.prepared_poster_compression.as_ref()
     }

@@ -13,7 +13,7 @@
 ///   6. `posterFee  = gasPrice * posterGas`.
 use revm::{
     context_interface::Transaction,
-    primitives::{TxKind, U256},
+    primitives::{Bytes, TxKind, U256},
 };
 
 use crate::constants::{
@@ -216,6 +216,18 @@ pub fn encode_tx_bytes<T: ArbTxTr>(tx: &T) -> Vec<u8> {
     encode_tx_for_l1_cost(tx)
 }
 
+/// Execution-owned bytes without copying an already shared canonical encoding.
+/// The existing borrowed API and exact fallback encoder remain authoritative for
+/// custom transaction implementations without the optional shared accessor.
+/// Protocol transactions stay empty even if they carry an encoded envelope.
+pub(crate) fn poster_tx_bytes<T: ArbTxTr>(tx: &T) -> Bytes {
+    if !tx_type_has_poster_costs(tx.tx_type()) {
+        return Bytes::new();
+    }
+    tx.encoded_2718_shared()
+        .unwrap_or_else(|| Bytes::from(encode_tx_bytes(tx)))
+}
+
 /// Immutable, opaque compression result prepared independently of EVM state.
 ///
 /// Only successful compression is retained. It owns the exact encoded input;
@@ -386,6 +398,84 @@ mod tests {
         ARBITRUM_DEPOSIT_TX_TYPE, ARBITRUM_INTERNAL_TX_TYPE, ARBITRUM_RETRY_TX_TYPE,
         ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE,
     };
+
+    use crate::ArbTransaction;
+    use revm::context::TxEnv;
+
+    // A downstream-style implementation retaining only the original borrowed API.
+    // Transaction itself already implements forwarding for references.
+    impl ArbTxTr for &ArbTransaction<TxEnv> {
+        fn encoded_2718_bytes(&self) -> Option<&[u8]> {
+            self.encoded_2718.as_ref().map(|bytes| bytes.as_ref())
+        }
+    }
+
+    #[test]
+    fn shared_canonical_bytes_retain_storage_and_survive_tx_replacement() {
+        let encoded = Bytes::from(vec![0x42; 512]);
+        let mut tx = ArbTransaction::new(TxEnv::default()).with_encoded_2718(encoded.clone());
+        let shared = poster_tx_bytes(&tx);
+        assert_eq!(shared.as_ptr(), encoded.as_ptr());
+        assert_eq!(shared.as_ref(), encode_tx_bytes(&tx));
+        tx.encoded_2718 = Some(Bytes::from(vec![0x99; 513]));
+        let replacement = poster_tx_bytes(&tx);
+        assert_eq!(replacement.as_ref(), encode_tx_bytes(&tx));
+        assert_ne!(replacement.as_ptr(), shared.as_ptr());
+        drop(tx);
+        assert_eq!(shared, encoded);
+    }
+
+    #[test]
+    fn shared_bytes_preserve_borrowed_custom_fallback_and_protocol_semantics() {
+        for tx_type in [
+            0,
+            1,
+            2,
+            3,
+            4,
+            ARBITRUM_INTERNAL_TX_TYPE,
+            ARBITRUM_DEPOSIT_TX_TYPE,
+            ARBITRUM_SUBMIT_RETRYABLE_TX_TYPE,
+            ARBITRUM_RETRY_TX_TYPE,
+        ] {
+            for encoded in [None, Some(Bytes::new()), Some(Bytes::from(vec![0x21; 256]))] {
+                let mut tx = ArbTransaction::new(TxEnv::default());
+                tx.base.tx_type = tx_type;
+                tx.encoded_2718 = encoded;
+                let old = encode_tx_bytes(&tx);
+                let shared = poster_tx_bytes(&tx);
+                let custom = &tx;
+                // Explicit UFCS selects the custom reference implementation's default.
+                assert!(
+                    <&ArbTransaction<TxEnv> as ArbTxTr>::encoded_2718_shared(&custom).is_none()
+                );
+                let fallback = poster_tx_bytes(&custom);
+                assert_eq!(shared.as_ref(), old);
+                assert_eq!(fallback.as_ref(), old);
+                if !tx_type_has_poster_costs(tx_type) {
+                    assert!(shared.is_empty());
+                }
+                for level in [0, 1, 4] {
+                    for (price, gas) in [
+                        (U256::ZERO, U256::ZERO),
+                        (U256::from(11), U256::from(3)),
+                        (U256::MAX, U256::ONE),
+                    ] {
+                        for coinbase in [BATCH_POSTER_ADDRESS, revm::primitives::Address::ZERO] {
+                            assert_same(
+                                compute_poster_info(&old, coinbase, price, gas, level),
+                                compute_poster_info(&shared, coinbase, price, gas, level),
+                            );
+                            assert_same(
+                                compute_poster_info(&old, coinbase, price, gas, level),
+                                compute_poster_info(&fallback, coinbase, price, gas, level),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn prepare(bytes: &[u8], level: u32) -> PreparedPosterCompression {
         PreparedPosterCompression::prepare(
