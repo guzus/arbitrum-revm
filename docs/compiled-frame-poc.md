@@ -32,6 +32,28 @@ cargo test -p arb-revm --features compiled-frame --lib compiled_frame
 cargo test -p arb-revm --features compiled-frame --test compiled_frame
 ```
 
+## Opt-in JIT symbol diagnostic
+
+`CompiledFrameRegistry::new(spec)` still requests simple perf maps **off**.
+A standalone diagnostic may use
+`CompiledFrameRegistry::new_with_simple_perf(spec)` before its first compile.
+There are no environment-variable switches or runtime setters. Both constructors
+retain the same immutable ArbOS BLOCKHASH semantics and normal execution controls.
+`identity().simple_perf_requested` records the request, not successful activation.
+
+LLVM initializes its shared ORC state on the process's first JIT compilation;
+that first compiler's setting wins for all subsequent compilers. Start a fresh
+process with the diagnostic constructor before any other JIT. Upstream plugin
+setup failure is logged as a warning and does not make construction fail. Verify
+`/tmp/perf-<target-pid>.map` exists and contains the expected `arb_<code_hash>`
+entries, and preserve that map with the perf artifact before the process exits.
+The map does not remove freed entries: keep this a short standalone diagnostic,
+not a long-lived production profiling service. Do not use profiled runs for
+performance comparisons; map existence alone does not prove useful samples.
+
+The focused `profile_configuration_tests` test checks explicit request wiring
+without JIT; actual map generation and symbol attribution require Linux evidence.
+
 ## Historical NUMBER-only prototype notes
 
 The remainder records the earlier 79e3c8ca prototype, including its historical
