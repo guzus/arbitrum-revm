@@ -100,3 +100,20 @@ with node-level attempt/commit/scheduler instrumentation. Timing alone does not
 establish dependency independence. For a partition leaving fraction s serial, the
 optimistic eight-worker bound is `1 / (s + (1-s)/8)`; greater than 5x needs s below
 3/35 (about 8.6%), before parallel overhead.
+
+## Combined-feature instruction guard regression
+
+The first combined `phase-timing,compiled-frame,stylus` Linux library run at
+`86f6ec6` had 159 passes and one failure in
+`evm::instruction_table_diff::arb_overrides_are_exactly_number_and_blockhash`.
+That test compared function addresses from independently initialized tables;
+codegen-unit duplication can give the same function different addresses.
+This failure is retained as failed qualification, not treated as a parity pass.
+
+The guard now snapshots one table before and after the canonical override helper.
+It checks every instruction address and gas entry, requires exactly NUMBER and
+BLOCKHASH mutations, and checks their costs. A reviewed full-constructor source
+snapshot rejects bypassing that helper. Updating the snapshot requires explicit
+review of all table mutations and existing compiled/interpreter opcode parity.
+No compiler eligibility rule or opcode behavior changed. Rerun the combined suite
+and feature-off checks before claiming this regression resolved.
