@@ -251,8 +251,8 @@ mod tests {
             0x61, 0x03, 0x09, 0x40, 0x60, 0, 0x52, 0x60, 32, 0x60, 0, 0xf3,
         ];
         // SAFETY: both compiler owners remain live through every call below.
-        let eth_fn = unsafe { eth.jit("ethereum_ring_coexist", &code, spec) }.unwrap();
-        let arb_fn = unsafe { arb.jit("arbos_ring_coexist", &code, spec) }.unwrap();
+        let eth_fn = unsafe { eth.jit("ethereum_ring_coexist", &code[..], spec) }.unwrap();
+        let arb_fn = unsafe { arb.jit("arbos_ring_coexist", &code[..], spec) }.unwrap();
         arb.clear_ir().unwrap();
         assert_eq!(arb.block_hash_semantics(), BlockHashSemantics::ArbosL1Ring);
         for (func, expected) in [
