@@ -484,20 +484,29 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct InjectedReadFailure;
+    impl std::fmt::Display for InjectedReadFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("injected read failure")
+        }
+    }
+    impl std::error::Error for InjectedReadFailure {}
+    impl revm::database_interface::DBErrorMarker for InjectedReadFailure {}
     struct FailingDb;
     impl Database for FailingDb {
-        type Error = std::io::Error;
+        type Error = InjectedReadFailure;
         fn basic(&mut self, _: Address) -> Result<Option<AccountInfo>, Self::Error> {
-            Err(std::io::Error::other("injected"))
+            Err(InjectedReadFailure)
         }
         fn code_by_hash(&mut self, _: B256) -> Result<Bytecode, Self::Error> {
-            Err(std::io::Error::other("injected"))
+            Err(InjectedReadFailure)
         }
         fn storage(&mut self, _: Address, _: U256) -> Result<U256, Self::Error> {
-            Err(std::io::Error::other("injected"))
+            Err(InjectedReadFailure)
         }
         fn block_hash(&mut self, _: u64) -> Result<B256, Self::Error> {
-            Err(std::io::Error::other("injected"))
+            Err(InjectedReadFailure)
         }
     }
     #[test]
