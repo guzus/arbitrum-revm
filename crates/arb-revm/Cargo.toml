@@ -59,6 +59,8 @@ revmc = { git = "https://github.com/paradigmxyz/revmc", rev = "79e3c8ca1980d98c8
 revmc-build = { git = "https://github.com/paradigmxyz/revmc", rev = "79e3c8ca1980d98c856034558ec7c7a9f3f3dd7d", optional = true }
 
 [features]
+# Isolated canonical-table interpreter experiment; never enabled by default.
+direct-stack-dispatch = []
 stylus = ["dep:stylus", "dep:arbutil", "dep:wasmer-types", "dep:wasm-encoder", "dep:wasmparser", "dep:wasmprinter", "dep:lru", "dep:lazy_static"]
 # Isolated compiled-frame PoC. Default-off. Does not replace ArbHandler.
 compiled-frame = ["dep:revmc", "dep:revmc-build"]

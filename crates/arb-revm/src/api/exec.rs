@@ -10,7 +10,7 @@ use revm::{
     },
     handler::{
         EthFrame, Handler, PrecompileProvider, SystemCallTx,
-        instructions::EthInstructions,
+        instructions::{EthInstructions, InstructionProvider},
         system_call::{SystemCallCommitEvm, SystemCallEvm},
     },
     inspector::{
@@ -60,11 +60,27 @@ impl<T> CompiledFrameCtx for T {}
 /// Error type for Arbitrum EVM execution.
 pub type ArbError<CTX> = EVMError<<<CTX as ContextTr>::Db as Database>::Error, InvalidTransaction>;
 
-impl<CTX, INSP, PRECOMPILE> ExecuteEvm
-    for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
+/// Instruction providers accepted by Arbitrum execution entry points.
+/// Existing mutable EthInstructions retains its original indirect execution path.
+pub trait ArbExecutionInstructions<CTX>:
+    InstructionProvider<Context = CTX, InterpreterTypes = EthInterpreter>
+{
+}
+impl<CTX: revm::interpreter::Host> ArbExecutionInstructions<CTX>
+    for EthInstructions<EthInterpreter, CTX>
+{
+}
+#[cfg(feature = "direct-stack-dispatch")]
+impl<CTX: revm::interpreter::Host> ArbExecutionInstructions<CTX>
+    for crate::stack_dispatch::CanonicalStackInstructions<CTX>
+{
+}
+
+impl<CTX, INSP, PRECOMPILE, I> ExecuteEvm for ArbEvm<CTX, INSP, I, PRECOMPILE>
 where
     CTX: ArbContextTr + ContextSetters + CompiledFrameCtx,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
+    I: ArbExecutionInstructions<CTX>,
 {
     type Tx = <CTX as ContextTr>::Tx;
     type Block = <CTX as ContextTr>::Block;
@@ -97,23 +113,23 @@ where
     }
 }
 
-impl<CTX, INSP, PRECOMPILE> ExecuteCommitEvm
-    for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
+impl<CTX, INSP, PRECOMPILE, I> ExecuteCommitEvm for ArbEvm<CTX, INSP, I, PRECOMPILE>
 where
     CTX: ArbContextTr<Db: DatabaseCommit> + ContextSetters + CompiledFrameCtx,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
+    I: ArbExecutionInstructions<CTX>,
 {
     fn commit(&mut self, state: Self::State) {
         self.0.ctx.db_mut().commit(state);
     }
 }
 
-impl<CTX, INSP, PRECOMPILE> InspectEvm
-    for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
+impl<CTX, INSP, PRECOMPILE, I> InspectEvm for ArbEvm<CTX, INSP, I, PRECOMPILE>
 where
     CTX: ArbContextTr<Journal: JournalExt> + ContextSetters + CompiledFrameCtx,
     INSP: Inspector<CTX, EthInterpreter>,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
+    I: ArbExecutionInstructions<CTX>,
 {
     type Inspector = INSP;
 
@@ -128,20 +144,20 @@ where
     }
 }
 
-impl<CTX, INSP, PRECOMPILE> InspectCommitEvm
-    for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
+impl<CTX, INSP, PRECOMPILE, I> InspectCommitEvm for ArbEvm<CTX, INSP, I, PRECOMPILE>
 where
     CTX: ArbContextTr<Journal: JournalExt, Db: DatabaseCommit> + ContextSetters + CompiledFrameCtx,
     INSP: Inspector<CTX, EthInterpreter>,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
+    I: ArbExecutionInstructions<CTX>,
 {
 }
 
-impl<CTX, INSP, PRECOMPILE> SystemCallEvm
-    for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
+impl<CTX, INSP, PRECOMPILE, I> SystemCallEvm for ArbEvm<CTX, INSP, I, PRECOMPILE>
 where
     CTX: ArbContextTr<Tx: SystemCallTx> + ContextSetters + CompiledFrameCtx,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
+    I: ArbExecutionInstructions<CTX>,
 {
     fn system_call_one_with_caller(
         &mut self,
@@ -159,12 +175,12 @@ where
     }
 }
 
-impl<CTX, INSP, PRECOMPILE> InspectSystemCallEvm
-    for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
+impl<CTX, INSP, PRECOMPILE, I> InspectSystemCallEvm for ArbEvm<CTX, INSP, I, PRECOMPILE>
 where
     CTX: ArbContextTr<Journal: JournalExt, Tx: SystemCallTx> + ContextSetters + CompiledFrameCtx,
     INSP: Inspector<CTX, EthInterpreter>,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
+    I: ArbExecutionInstructions<CTX>,
 {
     fn inspect_one_system_call_with_caller(
         &mut self,
@@ -182,11 +198,11 @@ where
     }
 }
 
-impl<CTX, INSP, PRECOMPILE> SystemCallCommitEvm
-    for ArbEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
+impl<CTX, INSP, PRECOMPILE, I> SystemCallCommitEvm for ArbEvm<CTX, INSP, I, PRECOMPILE>
 where
     CTX: ArbContextTr<Db: DatabaseCommit, Tx: SystemCallTx> + ContextSetters + CompiledFrameCtx,
     PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
+    I: ArbExecutionInstructions<CTX>,
 {
     fn system_call_with_caller_commit(
         &mut self,
